@@ -5,7 +5,7 @@ const NGUONC_API = 'https://phim.nguonc.com/api';
 
 const builder = new addonBuilder({
     id: 'org.nguonc.stremio.official',
-    version: '1.9.0',
+    version: '2.0.0',
     name: 'NguonC Full Multi-Catalog & Stream',
     description: 'Xem đầy đủ Phim Lẻ, Phim Bộ, Hoạt Hình và TV Shows Vietsub từ NguonC',
     resources: ['catalog', 'meta', 'stream'],
@@ -155,13 +155,12 @@ builder.defineMetaHandler(async ({ type, id }) => {
     }
 });
 
-// 3. Stream Handler (Đã tối ưu hóa tìm kiếm link stream)
+// 3. Stream Handler (BẮT BUỘC PHÁT TRỰC TIẾP TRÊN STREMIO)
 builder.defineStreamHandler(async ({ type, id }) => {
     try {
         let slug = id;
         let episodeTarget = 1;
 
-        // Xử lý ID dạng nguonc_slug:episode
         if (id.startsWith('nguonc_')) {
             const rawId = id.replace('nguonc_', '');
             const parts = rawId.split(':');
@@ -170,7 +169,6 @@ builder.defineStreamHandler(async ({ type, id }) => {
                 episodeTarget = parseInt(parts[1], 10) || 1;
             }
         } else if (id.startsWith('tt')) {
-            // Xử lý ID dạng IMDb tt123456:1:1
             const parts = id.split(':');
             const imdbId = parts[0];
             if (parts.length > 1) {
@@ -202,35 +200,24 @@ builder.defineStreamHandler(async ({ type, id }) => {
 
             if (epItems.length === 0) continue;
 
-            // Tìm tập phù hợp
             let targetEp = epItems.find(ep => {
                 const epNum = parseInt(ep.name, 10) || parseInt(ep.slug?.replace(/\D/g, ''), 10);
                 return epNum === episodeTarget;
             });
 
-            // Nếu không tìm thấy chính xác tập, lấy theo vị trí index hoặc tập đầu
             if (!targetEp) {
                 targetEp = epItems[episodeTarget - 1] || epItems[0];
             }
 
             if (targetEp) {
+                // Ưu tiên lấy trực tiếp link m3u8
                 const streamUrl = targetEp.m3u8 || targetEp.link_m3u8 || targetEp.embed || targetEp.link_embed;
                 if (streamUrl) {
-                    // Nếu là link iframe/embed, thêm dạng externalUrl
-                    if (streamUrl.includes('embed') || !streamUrl.endsWith('.m3u8')) {
-                        streams.push({
-                            name: `[NguonC] ${serverName} (Web)`,
-                            title: `${movie?.name || 'Phim'}\n${targetEp.name ? 'Tập ' + targetEp.name : 'Full'} - Bấm để mở trình duyệt`,
-                            externalUrl: streamUrl
-                        });
-                    } else {
-                        // Link m3u8 phát trực tiếp trong Stremio
-                        streams.push({
-                            name: `[NguonC] ${serverName}`,
-                            title: `${movie?.name || 'Phim'}\n${targetEp.name ? 'Tập ' + targetEp.name : 'Full'} - Full HD`,
-                            url: streamUrl
-                        });
-                    }
+                    streams.push({
+                        name: `[NguonC] ${serverName}`,
+                        title: `${movie?.name || 'Phim'}\n${targetEp.name ? 'Tập ' + targetEp.name : 'Full'} - [In-App Player]`,
+                        url: streamUrl
+                    });
                 }
             }
         }
