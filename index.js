@@ -5,7 +5,7 @@ const NGUONC_API = 'https://phim.nguonc.com/api';
 
 const builder = new addonBuilder({
     id: 'org.nguonc.stremio.official',
-    version: '1.5.0',
+    version: '1.6.0',
     name: 'NguonC Full Multi-Catalog & Stream',
     description: 'Xem đầy đủ Phim Lẻ, Phim Bộ, Hoạt Hình và TV Shows Vietsub từ NguonC',
     resources: ['catalog', 'meta', 'stream'],
@@ -16,44 +16,36 @@ const builder = new addonBuilder({
             type: 'movie',
             id: 'nguonc_movies',
             name: 'NguonC - Phim Lẻ',
-            extra: [
-                { name: 'search', isRequired: false },
-                { name: 'skip', isRequired: false }
-            ]
+            extra: [{ name: 'search' }, { name: 'skip' }],
+            extraSupported: ['search', 'skip']
         },
         {
             type: 'series',
             id: 'nguonc_series',
             name: 'NguonC - Phim Bộ',
-            extra: [
-                { name: 'search', isRequired: false },
-                { name: 'skip', isRequired: false }
-            ]
+            extra: [{ name: 'search' }, { name: 'skip' }],
+            extraSupported: ['search', 'skip']
         },
         {
             type: 'anime',
             id: 'nguonc_hoathinh',
             name: 'NguonC - Hoạt Hình',
-            extra: [
-                { name: 'search', isRequired: false },
-                { name: 'skip', isRequired: false }
-            ]
+            extra: [{ name: 'search' }, { name: 'skip' }],
+            extraSupported: ['search', 'skip']
         },
         {
             type: 'series',
             id: 'nguonc_tvshows',
             name: 'NguonC - TV Shows',
-            extra: [
-                { name: 'search', isRequired: false },
-                { name: 'skip', isRequired: false }
-            ]
+            extra: [{ name: 'search' }, { name: 'skip' }],
+            extraSupported: ['search', 'skip']
         }
     ]
 });
 
 async function fetchNguonC(endpoint) {
     try {
-        const res = await axios.get(`${NGUONC_API}${endpoint}`, { timeout: 8000 });
+        const res = await axios.get(`${NGUONC_API}${endpoint}`, { timeout: 10000 });
         return res.data;
     } catch (err) {
         return null;
@@ -70,16 +62,15 @@ async function getMovieTitleFromImdb(type, imdbId) {
     }
 }
 
-// 1. Handler Danh mục & Phân trang (Xem được rất nhiều phim)
+// 1. Handler Catalog & Phân trang (Cuộn để load tiếp danh sách phim)
 builder.defineCatalogHandler(async ({ type, id, extra }) => {
     try {
-        // Tính số trang dựa trên độ cuộn (skip) của Stremio
         const skip = (extra && extra.skip) ? parseInt(extra.skip, 10) : 0;
-        const page = Math.floor(skip / 20) + 1;
+        // Mỗi trang NguonC có khoảng 10 phim
+        const page = Math.floor(skip / 10) + 1;
 
         let endpoint = `/films/phim-moi-cap-nhat?page=${page}`;
 
-        // Phân loại danh mục theo endpoint API NguonC
         if (id === 'nguonc_movies') {
             endpoint = `/films/danh-sach/phim-le?page=${page}`;
         } else if (id === 'nguonc_series') {
@@ -90,7 +81,6 @@ builder.defineCatalogHandler(async ({ type, id, extra }) => {
             endpoint = `/films/danh-sach/tv-shows?page=${page}`;
         }
 
-        // Xử lý khi người dùng Tìm kiếm từ khóa
         if (extra && extra.search) {
             endpoint = `/films/search?keyword=${encodeURIComponent(extra.search)}`;
         }
@@ -116,7 +106,10 @@ builder.defineCatalogHandler(async ({ type, id, extra }) => {
 builder.defineMetaHandler(async ({ type, id }) => {
     try {
         if (!id.startsWith('nguonc_')) return { meta: null };
-        const slug = id.replace('nguonc_', '');
+        
+        // Lấy slug nguyên bản (Bỏ tiền tố nguonc_ và phần : tập nếu có)
+        const rawId = id.replace('nguonc_', '');
+        const slug = rawId.split(':')[0];
 
         const detailData = await fetchNguonC(`/film/${slug}`);
         const movie = detailData?.movie;
@@ -130,7 +123,7 @@ builder.defineMetaHandler(async ({ type, id }) => {
 
             epItems.forEach((ep, index) => {
                 episodesList.push({
-                    id: `${id}:${index + 1}`,
+                    id: `nguonc_${slug}:${index + 1}`,
                     title: ep.name ? `Tập ${ep.name}` : `Tập ${index + 1}`,
                     season: 1,
                     episode: index + 1
@@ -139,7 +132,7 @@ builder.defineMetaHandler(async ({ type, id }) => {
         }
 
         const meta = {
-            id: id,
+            id: `nguonc_${slug}`,
             type: type,
             name: movie.name,
             poster: movie.poster_url || movie.thumb_url,
@@ -161,8 +154,9 @@ builder.defineStreamHandler(async ({ type, id }) => {
         let episode = 1;
 
         if (id.startsWith('nguonc_')) {
-            const parts = id.split(':');
-            slug = parts[0].replace('nguonc_', '');
+            const rawId = id.replace('nguonc_', '');
+            const parts = rawId.split(':');
+            slug = parts[0];
             if (parts.length > 1) {
                 episode = parseInt(parts[1], 10) || 1;
             }
