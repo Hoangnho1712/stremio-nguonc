@@ -5,7 +5,7 @@ const NGUONC_API = 'https://phim.nguonc.com/api';
 
 const builder = new addonBuilder({
     id: 'org.nguonc.stremio.official',
-    version: '2.2.0',
+    version: '2.3.0',
     name: 'NguonC Full Multi-Catalog & Stream',
     description: 'Xem đầy đủ Phim Lẻ, Phim Bộ, Hoạt Hình và TV Shows Vietsub từ NguonC',
     resources: ['catalog', 'meta', 'stream'],
@@ -56,6 +56,28 @@ async function getMovieTitleFromImdb(type, imdbId) {
     } catch (err) {
         return null;
     }
+}
+
+// Hàm trích xuất link M3U8 thật từ Embed Player của NguonC
+async function extractDirectM3u8(embedUrl) {
+    try {
+        const res = await axios.get(embedUrl, {
+            headers: {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "Referer": "https://phim.nguonc.com/"
+            },
+            timeout: 5000
+        });
+
+        // Bóc tách URL m3u8 từ script iframe
+        const match = res.data.match(/(https?:\/\/[^"'\s]+\.m3u8[^"'\s]*)/i);
+        if (match && match[1]) {
+            return match[1];
+        }
+    } catch (e) {
+        // Ignore error
+    }
+    return embedUrl; // Fallback link gốc
 }
 
 // 1. Catalog Handler
@@ -137,7 +159,7 @@ builder.defineMetaHandler(async ({ type, id }) => {
     }
 });
 
-// 3. Stream Handler (Fix triệt để tìm kiếm luồng & fallback)
+// 3. Stream Handler (BẮT BUỘC BÓC TÁCH LINK TẬN GỐC)
 builder.defineStreamHandler(async ({ type, id }) => {
     try {
         let slug = id;
@@ -182,7 +204,6 @@ builder.defineStreamHandler(async ({ type, id }) => {
 
             if (!epItems || epItems.length === 0) continue;
 
-            // Tìm tập tương ứng
             let targetEp = epItems.find(ep => {
                 const epNum = parseInt(ep.name, 10) || parseInt(ep.slug?.replace(/\D/g, ''), 10);
                 return epNum === episodeTarget;
@@ -193,15 +214,19 @@ builder.defineStreamHandler(async ({ type, id }) => {
             }
 
             if (targetEp) {
-                const m3u8Url = targetEp.m3u8 || targetEp.link_m3u8;
-                const embedUrl = targetEp.embed || targetEp.link_embed;
+                let rawStreamUrl = targetEp.m3u8 || targetEp.link_m3u8 || targetEp.embed || targetEp.link_embed;
 
-                // 1. Luồng Direct Stream M3U8 (Chạy trực tiếp Stremio Player)
-                if (m3u8Url) {
+                if (rawStreamUrl) {
+                    // Nếu là link embed, thực hiện extract lấy direct link m3u8
+                    let directM3u8 = rawStreamUrl;
+                    if (!rawStreamUrl.includes('.m3u8')) {
+                        directM3u8 = await extractDirectM3u8(rawStreamUrl);
+                    }
+
                     streams.push({
                         name: `[NguonC] ${serverName}`,
-                        title: `${movie?.name || 'Phim'}\n${targetEp.name ? 'Tập ' + targetEp.name : 'Full'} - Auto Player`,
-                        url: m3u8Url,
+                        title: `${movie?.name || 'Phim'}\n${targetEp.name ? 'Tập ' + targetEp.name : 'Full'} - Direct Stream`,
+                        url: directM3u8,
                         behaviorHints: {
                             notSupported: false,
                             proxyHeaders: {
@@ -212,15 +237,6 @@ builder.defineStreamHandler(async ({ type, id }) => {
                                 }
                             }
                         }
-                    });
-                }
-
-                // 2. Luồng Fallback Web Embed (Phòng trường hợp m3u8 bị chết/chặn)
-                if (embedUrl && embedUrl !== m3u8Url) {
-                    streams.push({
-                        name: `[NguonC-Web] ${serverName}`,
-                        title: `${movie?.name || 'Phim'}\n${targetEp.name ? 'Tập ' + targetEp.name : 'Full'} - Link Web Dự Phòng`,
-                        externalUrl: embedUrl
                     });
                 }
             }
