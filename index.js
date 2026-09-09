@@ -6,10 +6,10 @@ const NGUONC_API = 'https://phim.nguonc.com/api';
 const PORT = process.env.PORT || 7000;
 
 const builder = new addonBuilder({
-    id: 'org.nguonc.stremio.v80',
-    version: '8.0.0',
-    name: 'NguonC God Mode',
-    description: 'Tự động giải mã Base64 & Gọi Server Dự Phòng (Ophim/KKPhim)',
+    id: 'org.nguonc.stremio.v90',
+    version: '9.0.0',
+    name: 'NguonC Max Direct',
+    description: 'Tối ưu tỷ lệ bóc tách Link Direct & Tìm kiếm dự phòng đa nguồn',
     resources: ['catalog', 'meta', 'stream'],
     types: ['movie', 'series', 'anime'],
     idPrefixes: ['tt', 'nguonc_'],
@@ -20,7 +20,6 @@ const builder = new addonBuilder({
     ]
 });
 
-// Hàm hỗ trợ
 async function fetchNguonC(endpoint) {
     try { const res = await axios.get(`${NGUONC_API}${endpoint}`, { timeout: 10000 }); return res.data; }
     catch (err) { return null; }
@@ -34,61 +33,68 @@ async function getMovieTitleFromImdb(type, imdbId) {
     } catch (err) { return null; }
 }
 
-// THUẬT TOÁN BÓC TÁCH M3U8 MÃ HÓA
-function extractM3U8(data) {
-    try {
-        const str = typeof data === 'string' ? data : JSON.stringify(data);
-        let decoded = str.replace(/\\u[\dA-F]{4}/gi, m => String.fromCharCode(parseInt(m.replace(/\\u/g, ''), 16)));
-        decoded = decoded.replace(/\\\//g, '/');
+// Bóc tách M3U8 thông minh (hỗ trợ unpack JS đơn giản)
+function extractM3U8FromHtml(html) {
+    if (!html) return null;
+    let str = typeof html === 'string' ? html : JSON.stringify(html);
 
-        // Tìm M3U8 dạng thường
-        let match = decoded.match(/(?:https?:)?\/\/[^"'\s<>\[\]{}()]+\.m3u8[^"'\s<>\[\]{}()]*/i);
-        if (match) {
-            let url = match[0];
-            if (url.startsWith('//')) url = 'https:' + url;
-            return url;
+    // 1. Tìm trực tiếp
+    let match = str.match(/(https?:\/\/[^"'\s<>\[\]{}()]+\.m3u8[^"'\s<>\[\]{}()]*)/i);
+    if (match) return match[1].replace(/\\/g, '');
+
+    // 2. Tìm dạng URL mã hóa Base64
+    let b64Matches = str.match(/(aHR0c[A-Za-z0-9+/=]+)/g);
+    if (b64Matches) {
+        for (let b64 of b64Matches) {
+            try {
+                let dec = Buffer.from(b64, 'base64').toString('utf8');
+                let m = dec.match(/(https?:\/\/[^"'\s<>\[\]{}()]+\.m3u8[^"'\s<>\[\]{}()]*)/i);
+                if (m) return m[1].replace(/\\/g, '');
+            } catch (e) {}
         }
-
-        // Tìm M3U8 dạng Base64 ẩn
-        let b64Matches = decoded.match(/(aHR0c[A-Za-z0-9+/=]+)/g);
-        if (b64Matches) {
-            for (let b64 of b64Matches) {
-                try {
-                    let dec = Buffer.from(b64, 'base64').toString('utf8');
-                    let m = dec.match(/(?:https?:)?\/\/[^"'\s<>\[\]{}()]+\.m3u8[^"'\s<>\[\]{}()]*/i);
-                    if (m) {
-                        let url = m[0];
-                        if (url.startsWith('//')) url = 'https:' + url;
-                        return url;
-                    }
-                } catch (e) {}
-            }
-        }
-    } catch (e) {}
-    return null;
-}
-
-// THUẬT TOÁN TÌM LINK TỪ SERVER DỰ PHÒNG
-async function fetchFallbackStream(slug, episodeTarget) {
-    const fallbackApis = [`https://ophim1.com/phim/${slug}`, `https://phimapi.com/phim/${slug}`];
-    for (const apiUrl of fallbackApis) {
-        try {
-            const res = await axios.get(apiUrl, { timeout: 5000 });
-            const servers = res.data?.episodes || [];
-            for (const server of servers) {
-                const epItems = server.server_data || [];
-                let targetEp = epItems.find(ep => (parseInt(ep.name, 10) || parseInt(ep.slug?.replace(/\D/g, ''), 10)) === episodeTarget);
-                if (!targetEp) targetEp = epItems[episodeTarget - 1] || epItems[0];
-                if (targetEp && targetEp.link_m3u8 && targetEp.link_m3u8.includes('.m3u8')) {
-                    return targetEp.link_m3u8;
-                }
-            }
-        } catch (e) {}
     }
     return null;
 }
 
-// 1. CATALOG & 2. META (Rút gọn hiển thị)
+// Tìm kiếm nâng cao ở các kho phim khác nếu NguonC bị mã hóa
+async function searchFallbackSources(movieName, episodeTarget) {
+    if (!movieName) return null;
+    const cleanName = movieName.replace(/[^\w\sàáảãạăắằẳẵặâấầẩẫậèéẻẽẹêếềểễệìíỉĩịòóỏõọôốồổỗộơớờởỡợùúủũụưứừửữựỳýỷỹỵđ]/gi, ' ').trim();
+    
+    // Kho 1: PhimAPI
+    try {
+        const res = await axios.get(`https://phimapi.com/v1/api/tim-kiem?keyword=${encodeURIComponent(cleanName)}`, { timeout: 4000 });
+        const items = res.data?.data?.items || [];
+        if (items.length > 0) {
+            const detail = await axios.get(`https://phimapi.com/phim/${items[0].slug}`, { timeout: 4000 });
+            const servers = detail.data?.episodes || [];
+            for (const s of servers) {
+                const epItems = s.server_data || [];
+                let targetEp = epItems.find(ep => (parseInt(ep.name, 10) || parseInt(ep.slug?.replace(/\D/g, ''), 10)) === episodeTarget) || epItems[0];
+                if (targetEp && targetEp.link_m3u8 && targetEp.link_m3u8.includes('.m3u8')) {
+                    return targetEp.link_m3u8;
+                }
+            }
+        }
+    } catch (e) {}
+
+    // Kho 2: Ophim
+    try {
+        const res = await axios.get(`https://ophim1.com/phim/${encodeURIComponent(cleanName.toLowerCase().replace(/\s+/g, '-'))}`, { timeout: 4000 });
+        const servers = res.data?.episodes || [];
+        for (const s of servers) {
+            const epItems = s.server_data || [];
+            let targetEp = epItems.find(ep => (parseInt(ep.name, 10) || parseInt(ep.slug?.replace(/\D/g, ''), 10)) === episodeTarget) || epItems[0];
+            if (targetEp && targetEp.link_m3u8 && targetEp.link_m3u8.includes('.m3u8')) {
+                return targetEp.link_m3u8;
+            }
+        }
+    } catch (e) {}
+
+    return null;
+}
+
+// 1. CATALOG & 2. META
 builder.defineCatalogHandler(async ({ type, id, extra }) => {
     try {
         const skip = (extra && extra.skip) ? parseInt(extra.skip, 10) : 0;
@@ -124,7 +130,7 @@ builder.defineMetaHandler(async ({ type, id }) => {
     } catch (e) { return { meta: null }; }
 });
 
-// 3. STREAM HANDLER (Tối thượng)
+// 3. STREAM HANDLER (Tối ưu hóa tìm Direct)
 builder.defineStreamHandler(async ({ type, id }) => {
     try {
         let slug = id; let episodeTarget = 1;
@@ -142,7 +148,8 @@ builder.defineStreamHandler(async ({ type, id }) => {
         }
 
         const detailData = await fetchNguonC(`/film/${slug}`);
-        const servers = detailData?.movie?.episodes || detailData?.episodes || [];
+        const movie = detailData?.movie || detailData?.film;
+        const servers = movie?.episodes || detailData?.episodes || [];
         const streams = [];
         const renderHost = process.env.RENDER_EXTERNAL_URL || 'https://stremio-nguonc-1.onrender.com';
 
@@ -154,41 +161,37 @@ builder.defineStreamHandler(async ({ type, id }) => {
             if (!targetEp) targetEp = epItems[episodeTarget - 1] || epItems[0];
 
             if (targetEp) {
-                let directM3u8 = extractM3U8(targetEp);
+                let directM3u8 = extractM3U8FromHtml(targetEp.m3u8 || targetEp.link_m3u8);
                 const embedUrl = targetEp.embed || targetEp.link_embed || "";
 
-                // Nhảy vào quét mã HTML trang Embed
+                // Quét mã HTML Embed
                 if (!directM3u8 && embedUrl) {
                     try {
-                        const res = await axios.get(embedUrl, { headers: { 'Referer': 'https://phim.nguonc.com/', 'User-Agent': 'Mozilla/5.0' }, timeout: 5000 });
-                        directM3u8 = extractM3U8(res.data);
+                        const res = await axios.get(embedUrl, { headers: { 'Referer': 'https://phim.nguonc.com/', 'User-Agent': 'Mozilla/5.0' }, timeout: 4000 });
+                        directM3u8 = extractM3U8FromHtml(res.data);
                     } catch (e) {}
                 }
 
-                // Nếu quét mã thất bại, gọi API Server Dự phòng cướp link
-                if (!directM3u8) directM3u8 = await fetchFallbackStream(slug, episodeTarget);
-
-                if (directM3u8) {
-                    streams.push({ name: `[Direct] Mượt`, title: `Tập ${targetEp.name || episodeTarget} - Proxy Server (Khuyên Dùng)`, url: `${renderHost}/proxy-m3u8?url=${encodeURIComponent(directM3u8)}` });
-                    streams.push({ name: `[Direct] Local`, title: `Tập ${targetEp.name || episodeTarget} - Mạng Cáp Quang Nhà Bạn`, url: directM3u8, behaviorHints: { requestHeaders: { "Referer": "https://phim.nguonc.com/", "Origin": "https://phim.nguonc.com/" } } });
+                // Tìm kiếm thông minh theo tên phim nếu NguonC bị chặn hoàn toàn
+                if (!directM3u8 && movie?.name) {
+                    directM3u8 = await searchFallbackSources(movie.name, episodeTarget);
                 }
 
-                if (embedUrl) streams.push({ name: `[Bảo Hiểm] Web`, title: `Tập ${targetEp.name || episodeTarget} - Mở qua web`, externalUrl: embedUrl });
+                if (directM3u8) {
+                    streams.push({ name: `[Direct] Mượt`, title: `Tập ${targetEp.name || episodeTarget} - Xem Trực Tiếp Stremio`, url: `${renderHost}/proxy-m3u8?url=${encodeURIComponent(directM3u8)}` });
+                }
+
+                if (embedUrl) {
+                    streams.push({ name: `[Bảo Hiểm] Web`, title: `Tập ${targetEp.name || episodeTarget} - Mở Web Player`, externalUrl: embedUrl });
+                }
             }
         }
 
-        // Loại bỏ luồng trùng lặp
-        const uniqueStreams = []; const seenUrls = new Set();
-        for (const st of streams) {
-            const idUrl = st.url || st.externalUrl;
-            if (!seenUrls.has(idUrl)) { seenUrls.add(idUrl); uniqueStreams.push(st); }
-        }
-
-        return { streams: uniqueStreams };
+        return { streams };
     } catch (e) { return { streams: [] }; }
 });
 
-// 4. SERVER PROXY (Bẻ Khóa HLS)
+// 4. PROXY SERVER
 const app = express();
 app.use((req, res, next) => { res.setHeader('Access-Control-Allow-Origin', '*'); next(); });
 
