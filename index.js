@@ -1,13 +1,15 @@
-const { addonBuilder, serveHTTP } = require('stremio-addon-sdk');
+const { addonBuilder } = require('stremio-addon-sdk');
+const express = require('express');
 const axios = require('axios');
 
 const NGUONC_API = 'https://phim.nguonc.com/api';
+const PORT = process.env.PORT || 7000;
 
 const builder = new addonBuilder({
-    id: 'org.nguonc.stremio.official',
-    version: '2.3.0',
-    name: 'NguonC Full Multi-Catalog & Stream',
-    description: 'Xem đầy đủ Phim Lẻ, Phim Bộ, Hoạt Hình và TV Shows Vietsub từ NguonC',
+    id: 'org.nguonc.stremio.proxy',
+    version: '3.1.0',
+    name: 'NguonC Stream Proxy',
+    description: 'Xem đầy đủ Phim Lẻ, Phim Bộ, Hoạt Hình Vietsub từ NguonC phát trực tiếp 100% trên Stremio',
     resources: ['catalog', 'meta', 'stream'],
     types: ['movie', 'series', 'anime'],
     idPrefixes: ['tt', 'nguonc_'],
@@ -46,38 +48,6 @@ async function fetchNguonC(endpoint) {
     } catch (err) {
         return null;
     }
-}
-
-async function getMovieTitleFromImdb(type, imdbId) {
-    try {
-        const reqType = type === 'anime' ? 'series' : type;
-        const res = await axios.get(`https://v3-cinemeta.strem.io/meta/${reqType}/${imdbId}.json`, { timeout: 5000 });
-        return res.data?.meta?.name || null;
-    } catch (err) {
-        return null;
-    }
-}
-
-// Hàm trích xuất link M3U8 thật từ Embed Player của NguonC
-async function extractDirectM3u8(embedUrl) {
-    try {
-        const res = await axios.get(embedUrl, {
-            headers: {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                "Referer": "https://phim.nguonc.com/"
-            },
-            timeout: 5000
-        });
-
-        // Bóc tách URL m3u8 từ script iframe
-        const match = res.data.match(/(https?:\/\/[^"'\s]+\.m3u8[^"'\s]*)/i);
-        if (match && match[1]) {
-            return match[1];
-        }
-    } catch (e) {
-        // Ignore error
-    }
-    return embedUrl; // Fallback link gốc
 }
 
 // 1. Catalog Handler
@@ -159,8 +129,8 @@ builder.defineMetaHandler(async ({ type, id }) => {
     }
 });
 
-// 3. Stream Handler (BẮT BUỘC BÓC TÁCH LINK TẬN GỐC)
-builder.defineStreamHandler(async ({ type, id }) => {
+// 3. Stream Handler (Gửi URL trỏ về Proxy Server của chính Addon)
+builder.defineStreamHandler(async ({ type, id, host }) => {
     try {
         let slug = id;
         let episodeTarget = 1;
@@ -172,22 +142,6 @@ builder.defineStreamHandler(async ({ type, id }) => {
             if (parts.length > 1) {
                 episodeTarget = parseInt(parts[1], 10) || 1;
             }
-        } else if (id.startsWith('tt')) {
-            const parts = id.split(':');
-            const imdbId = parts[0];
-            if (parts.length > 1) {
-                episodeTarget = parseInt(parts[2], 10) || 1;
-            }
-
-            const movieTitle = await getMovieTitleFromImdb(type, imdbId);
-            if (!movieTitle) return { streams: [] };
-
-            const searchData = await fetchNguonC(`/films/search?keyword=${encodeURIComponent(movieTitle)}`);
-            const items = searchData?.items || searchData?.data?.items || [];
-            const film = items[0];
-
-            if (!film || !film.slug) return { streams: [] };
-            slug = film.slug;
         }
 
         const detailData = await fetchNguonC(`/film/${slug}`);
@@ -214,29 +168,15 @@ builder.defineStreamHandler(async ({ type, id }) => {
             }
 
             if (targetEp) {
-                let rawStreamUrl = targetEp.m3u8 || targetEp.link_m3u8 || targetEp.embed || targetEp.link_embed;
-
-                if (rawStreamUrl) {
-                    // Nếu là link embed, thực hiện extract lấy direct link m3u8
-                    let directM3u8 = rawStreamUrl;
-                    if (!rawStreamUrl.includes('.m3u8')) {
-                        directM3u8 = await extractDirectM3u8(rawStreamUrl);
-                    }
-
+                const rawUrl = targetEp.m3u8 || targetEp.link_m3u8 || targetEp.embed || targetEp.link_embed;
+                if (rawUrl) {
+                    // Định tuyến luồng phát qua đường dẫn Proxy /proxy-stream trên Render
+                    const proxyUrl = `${host}/proxy-stream?url=${encodeURIComponent(rawUrl)}`;
+                    
                     streams.push({
                         name: `[NguonC] ${serverName}`,
-                        title: `${movie?.name || 'Phim'}\n${targetEp.name ? 'Tập ' + targetEp.name : 'Full'} - Direct Stream`,
-                        url: directM3u8,
-                        behaviorHints: {
-                            notSupported: false,
-                            proxyHeaders: {
-                                request: {
-                                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                                    "Referer": "https://phim.nguonc.com/",
-                                    "Origin": "https://phim.nguonc.com"
-                                }
-                            }
-                        }
+                        title: `${movie?.name || 'Phim'}\n${targetEp.name ? 'Tập ' + targetEp.name : 'Full'} - Full HD Direct Proxy`,
+                        url: proxyUrl
                     });
                 }
             }
@@ -248,5 +188,74 @@ builder.defineStreamHandler(async ({ type, id }) => {
     }
 });
 
-const PORT = process.env.PORT || 7000;
-serveHTTP(builder.getInterface(), { port: PORT });
+// 4. KHỞI TẠO EXPRESS APP & PROXY ENGINE
+const app = express();
+const addonInterface = builder.getInterface();
+
+app.use((req, res, next) => {
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Headers', '*');
+    next();
+});
+
+// Trạm trung chuyển Proxy Stream: Tự động giả lập Referer NguonC cho toàn bộ dữ liệu video
+app.get('/proxy-stream', async (req, res) => {
+    try {
+        const targetUrl = req.query.url;
+        if (!targetUrl) return res.status(400).send('Missing url parameter');
+
+        // Bóc tách link m3u8 nếu truyền vào link embed web
+        let streamUrl = targetUrl;
+        if (!streamUrl.includes('.m3u8')) {
+            const embedRes = await axios.get(streamUrl, {
+                headers: {
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
+                    'Referer': 'https://phim.nguonc.com/'
+                },
+                timeout: 5000
+            });
+            const match = embedRes.data.match(/(https?:\/\/[^"'\s]+\.m3u8[^"'\s]*)/i);
+            if (match && match[1]) {
+                streamUrl = match[1];
+            }
+        }
+
+        const response = await axios({
+            method: 'get',
+            url: streamUrl,
+            headers: {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                'Referer': 'https://phim.nguonc.com/',
+                'Origin': 'https://phim.nguonc.com'
+            },
+            responseType: 'stream'
+        });
+
+        if (response.headers['content-type']) {
+            res.setHeader('Content-Type', response.headers['content-type']);
+        }
+
+        response.data.pipe(res);
+    } catch (err) {
+        res.status(500).send('Proxy Stream Error');
+    }
+});
+
+// Phục vụ Stremio Addon Router
+app.get('/manifest.json', (req, res) => res.json(addonInterface.manifest));
+app.get('/:resource/:type/:id.json', (req, res) => {
+    const { resource, type, id } = req.params;
+    const extra = req.query;
+    const protocol = req.headers['x-forwarded-proto'] || req.protocol;
+    const host = `${protocol}://${req.get('host')}`;
+
+    addonInterface.get(resource, type, id, extra, { host }).then(resp => {
+        res.json(resp);
+    }).catch(err => {
+        res.status(500).json({ err: 'Internal error' });
+    });
+});
+
+app.listen(PORT, () => {
+    console.log(`NguonC Proxy Addon is running on port ${PORT}`);
+});
