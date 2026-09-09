@@ -6,10 +6,10 @@ const NGUONC_API = 'https://phim.nguonc.com/api';
 const PORT = process.env.PORT || 7000;
 
 const builder = new addonBuilder({
-    id: 'org.nguonc.stremio.proxy.v41',
-    version: '4.1.0',
-    name: 'NguonC HLS Proxy Native',
-    description: 'Chạy NguonC mượt 100% bằng công nghệ viết lại luồng M3U8/TS',
+    id: 'org.nguonc.stremio.v50',
+    version: '5.0.0',
+    name: 'NguonC Stream Direct & Proxy',
+    description: 'Xem phim NguonC mượt mà, không giật lag trên mọi thiết bị Stremio',
     resources: ['catalog', 'meta', 'stream'],
     types: ['movie', 'series', 'anime'],
     idPrefixes: ['tt', 'nguonc_'],
@@ -24,7 +24,28 @@ async function fetchNguonC(endpoint) {
     try {
         const res = await axios.get(`${NGUONC_API}${endpoint}`, { timeout: 10000 });
         return res.data;
-    } catch (err) { return null; }
+    } catch (err) {
+        return null;
+    }
+}
+
+// Bóc tách link M3U8 từ Embed nếu có
+async function extractM3u8Url(url) {
+    if (!url) return null;
+    if (url.includes('.m3u8')) return url;
+    try {
+        const res = await axios.get(url, {
+            headers: {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
+                'Referer': 'https://phim.nguonc.com/'
+            },
+            timeout: 5000
+        });
+        const match = res.data.match(/(https?:\/\/[^"'\s]+\.m3u8[^"'\s]*)/i);
+        return match ? match[1] : url;
+    } catch (e) {
+        return url;
+    }
 }
 
 async function getMovieTitleFromImdb(type, imdbId) {
@@ -32,7 +53,9 @@ async function getMovieTitleFromImdb(type, imdbId) {
         const reqType = type === 'anime' ? 'series' : type;
         const res = await axios.get(`https://v3-cinemeta.strem.io/meta/${reqType}/${imdbId}.json`, { timeout: 5000 });
         return res.data?.meta?.name || null;
-    } catch (err) { return null; }
+    } catch (err) {
+        return null;
+    }
 }
 
 // 1. CATALOG HANDLER
@@ -62,7 +85,9 @@ builder.defineCatalogHandler(async ({ type, id, extra }) => {
         }));
 
         return { metas };
-    } catch (error) { return { metas: [] }; }
+    } catch (error) {
+        return { metas: [] };
+    }
 });
 
 // 2. META HANDLER
@@ -84,26 +109,33 @@ builder.defineMetaHandler(async ({ type, id }) => {
                 episodesList.push({
                     id: `nguonc_${slug}:${index + 1}`,
                     title: ep.name ? `Tập ${ep.name}` : `Tập ${index + 1}`,
-                    season: 1, episode: index + 1
+                    season: 1,
+                    episode: index + 1
                 });
             });
         }
 
         return {
             meta: {
-                id: `nguonc_${slug}`, type, name: movie.name,
-                poster: movie.poster_url || movie.thumb_url, background: movie.poster_url || movie.thumb_url,
+                id: `nguonc_${slug}`,
+                type: type,
+                name: movie.name,
+                poster: movie.poster_url || movie.thumb_url,
+                background: movie.poster_url || movie.thumb_url,
                 description: movie.description || movie.content || movie.original_name || '',
                 videos: episodesList.length > 0 ? episodesList : undefined
             }
         };
-    } catch (error) { return { meta: null }; }
+    } catch (error) {
+        return { meta: null };
+    }
 });
 
-// 3. STREAM HANDLER
+// 3. STREAM HANDLER (Phát trực tiếp không qua Render Proxy)
 builder.defineStreamHandler(async ({ type, id }) => {
     try {
-        let slug = id; let episodeTarget = 1;
+        let slug = id;
+        let episodeTarget = 1;
 
         if (id.startsWith('nguonc_')) {
             const parts = id.replace('nguonc_', '').split(':');
@@ -139,19 +171,41 @@ builder.defineStreamHandler(async ({ type, id }) => {
             if (targetEp) {
                 const rawUrl = targetEp.m3u8 || targetEp.link_m3u8 || targetEp.embed || targetEp.link_embed;
                 if (rawUrl) {
+                    const directM3u8 = await extractM3u8Url(rawUrl);
+
+                    // Luồng 1: Trực Tiếp (Khuyên dùng - Kết nối thẳng thiết bị -> NguonC CDN)
                     streams.push({
-                        name: `[NguonC] Server`,
-                        title: `Tập ${targetEp.name || 'Full'} - Auto HLS`,
-                        url: `${renderHost}/proxy-m3u8?url=${encodeURIComponent(rawUrl)}`
+                        name: `[NguonC] Direct`,
+                        title: `Tập ${targetEp.name || episodeTarget} - Trực Tiếp Full HD (Khuyên dùng)`,
+                        url: directM3u8,
+                        behaviorHints: {
+                            notSupported: false,
+                            proxyHeaders: {
+                                request: {
+                                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+                                    "Referer": "https://phim.nguonc.com/"
+                                }
+                            }
+                        }
+                    });
+
+                    // Luồng 2: Proxy Backup
+                    streams.push({
+                        name: `[NguonC] Backup Proxy`,
+                        title: `Tập ${targetEp.name || episodeTarget} - Proxy Server`,
+                        url: `${renderHost}/proxy-m3u8?url=${encodeURIComponent(directM3u8)}`,
+                        behaviorHints: { notSupported: false }
                     });
                 }
             }
         }
         return { streams };
-    } catch (error) { return { streams: [] }; }
+    } catch (error) {
+        return { streams: [] };
+    }
 });
 
-// 4. EXPRESS APP & STREMIO SDK ROUTER
+// 4. EXPRESS APP & ROUTER
 const app = express();
 
 app.use((req, res, next) => {
@@ -160,55 +214,69 @@ app.use((req, res, next) => {
     next();
 });
 
-// Proxy M3U8 Rewriter
 app.get('/proxy-m3u8', async (req, res) => {
     try {
         let targetUrl = req.query.url;
         if (!targetUrl) return res.status(400).send('Missing url');
 
-        if (!targetUrl.includes('.m3u8')) {
-            const htmlRes = await axios.get(targetUrl, { headers: { 'Referer': 'https://phim.nguonc.com/' }});
-            const match = htmlRes.data.match(/(https?:\/\/[^"'\s]+\.m3u8[^"'\s]*)/i);
-            if (match && match[1]) targetUrl = match[1]; else return res.status(404).send('M3U8 not found');
-        }
+        const response = await axios.get(targetUrl, {
+            headers: {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
+                'Referer': 'https://phim.nguonc.com/'
+            },
+            responseType: 'text',
+            timeout: 10000
+        });
 
-        const response = await axios.get(targetUrl, { headers: { 'Referer': 'https://phim.nguonc.com/' } });
-        const baseUrl = targetUrl.substring(0, targetUrl.lastIndexOf('/') + 1);
+        const finalUrl = response.request?.res?.responseUrl || targetUrl;
         const hostUrl = `${req.protocol}://${req.get('host')}`;
 
         let m3u8Content = response.data.replace(/URI="(.*?)"/g, (match, p1) => {
-            let absUrl = p1.startsWith('http') ? p1 : baseUrl + p1;
+            const absUrl = new URL(p1, finalUrl).href;
             return `URI="${hostUrl}/proxy-ts?url=${encodeURIComponent(absUrl)}"`;
         });
 
         const proxiedLines = m3u8Content.split('\n').map(line => {
             const tLine = line.trim();
             if (!tLine || tLine.startsWith('#')) return line;
-            let absUrl = tLine.startsWith('http') ? tLine : baseUrl + tLine;
-            return absUrl.includes('.m3u8') 
-                ? `${hostUrl}/proxy-m3u8?url=${encodeURIComponent(absUrl)}` 
+            
+            const absUrl = new URL(tLine, finalUrl).href;
+            return absUrl.includes('.m3u8')
+                ? `${hostUrl}/proxy-m3u8?url=${encodeURIComponent(absUrl)}`
                 : `${hostUrl}/proxy-ts?url=${encodeURIComponent(absUrl)}`;
         });
 
-        res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
+        res.setHeader('Content-Type', 'application/x-mpegURL');
         res.send(proxiedLines.join('\n'));
-    } catch (e) { res.status(500).send('M3U8 Proxy Error'); }
+    } catch (e) {
+        res.status(500).send('M3U8 Proxy Error');
+    }
 });
 
-// Proxy TS Segments
 app.get('/proxy-ts', async (req, res) => {
     try {
         const targetUrl = req.query.url;
+        if (!targetUrl) return res.status(400).send('Missing url');
+
         const response = await axios({
-            method: 'get', url: targetUrl, responseType: 'stream',
-            headers: { 'Referer': 'https://phim.nguonc.com/', 'Origin': 'https://phim.nguonc.com' }
+            method: 'get',
+            url: targetUrl,
+            responseType: 'stream',
+            headers: {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
+                'Referer': 'https://phim.nguonc.com/',
+                'Origin': 'https://phim.nguonc.com'
+            },
+            timeout: 15000
         });
-        if (response.headers['content-type']) res.setHeader('Content-Type', response.headers['content-type']);
+
+        res.setHeader('Content-Type', response.headers['content-type'] || 'video/mp2t');
         response.data.pipe(res);
-    } catch (e) { res.status(500).send('TS Proxy Error'); }
+    } catch (e) {
+        res.status(500).send('TS Proxy Error');
+    }
 });
 
-// ROUTER CHUẨN STREMIO SDK (Sửa dứt điểm lỗi Protocol Violation)
 const addonRouter = getRouter(builder.getInterface());
 app.use('/', addonRouter);
 
