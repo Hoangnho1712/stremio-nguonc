@@ -1,4 +1,4 @@
-const { addonBuilder } = require('stremio-addon-sdk');
+const { addonBuilder, getRouter } = require('stremio-addon-sdk');
 const express = require('express');
 const axios = require('axios');
 
@@ -6,8 +6,8 @@ const NGUONC_API = 'https://phim.nguonc.com/api';
 const PORT = process.env.PORT || 7000;
 
 const builder = new addonBuilder({
-    id: 'org.nguonc.stremio.proxy.v4',
-    version: '4.0.0',
+    id: 'org.nguonc.stremio.proxy.v41',
+    version: '4.1.0',
     name: 'NguonC HLS Proxy Native',
     description: 'Chạy NguonC mượt 100% bằng công nghệ viết lại luồng M3U8/TS',
     resources: ['catalog', 'meta', 'stream'],
@@ -35,11 +35,11 @@ async function getMovieTitleFromImdb(type, imdbId) {
     } catch (err) { return null; }
 }
 
-// 1. CHUẨN HOÁ DANH SÁCH (Fix lỗi 8 phim)
+// 1. CATALOG HANDLER
 builder.defineCatalogHandler(async ({ type, id, extra }) => {
     try {
         const skip = (extra && extra.skip) ? parseInt(extra.skip, 10) : 0;
-        const page = Math.floor(skip / 10) + 1; // NguonC load chuẩn 10 phim / trang
+        const page = Math.floor(skip / 10) + 1;
 
         let endpoint = `/films/phim-moi-cap-nhat?page=${page}`;
         if (id === 'nguonc_movies') endpoint = `/films/danh-sach/phim-le?page=${page}`;
@@ -100,7 +100,7 @@ builder.defineMetaHandler(async ({ type, id }) => {
     } catch (error) { return { meta: null }; }
 });
 
-// 3. TÌM KIẾM LUỒNG (Fix No Streams Found)
+// 3. STREAM HANDLER
 builder.defineStreamHandler(async ({ type, id }) => {
     try {
         let slug = id; let episodeTarget = 1;
@@ -110,7 +110,6 @@ builder.defineStreamHandler(async ({ type, id }) => {
             slug = parts[0];
             if (parts.length > 1) episodeTarget = parseInt(parts[1], 10) || 1;
         } else if (id.startsWith('tt')) {
-            // Tự động giải mã ID IMDb sang Tên Phim -> Tìm trên NguonC
             const parts = id.split(':');
             if (type === 'series' && parts.length > 2) episodeTarget = parseInt(parts[2], 10) || 1;
 
@@ -152,16 +151,16 @@ builder.defineStreamHandler(async ({ type, id }) => {
     } catch (error) { return { streams: [] }; }
 });
 
-// 4. HLS REWRITER PROXY (Ép luồng M3U8/TS chạy qua Render)
+// 4. EXPRESS APP & STREMIO SDK ROUTER
 const app = express();
-const addonInterface = builder.getInterface();
 
 app.use((req, res, next) => {
-    res.setHeader('Access-Control-Allow-Origin', '*'); next();
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Headers', '*');
+    next();
 });
 
-app.get('/', (req, res) => res.redirect('/manifest.json'));
-
+// Proxy M3U8 Rewriter
 app.get('/proxy-m3u8', async (req, res) => {
     try {
         let targetUrl = req.query.url;
@@ -196,6 +195,7 @@ app.get('/proxy-m3u8', async (req, res) => {
     } catch (e) { res.status(500).send('M3U8 Proxy Error'); }
 });
 
+// Proxy TS Segments
 app.get('/proxy-ts', async (req, res) => {
     try {
         const targetUrl = req.query.url;
@@ -208,9 +208,8 @@ app.get('/proxy-ts', async (req, res) => {
     } catch (e) { res.status(500).send('TS Proxy Error'); }
 });
 
-app.get('/manifest.json', (req, res) => res.json(addonInterface.manifest));
-app.get('/:resource/:type/:id.json', (req, res) => {
-    addonInterface.get(req.params.resource, req.params.type, req.params.id, req.query).then(resp => res.json(resp)).catch(() => res.status(500).send('Err'));
-});
+// ROUTER CHUẨN STREMIO SDK (Sửa dứt điểm lỗi Protocol Violation)
+const addonRouter = getRouter(builder.getInterface());
+app.use('/', addonRouter);
 
-app.listen(PORT, () => console.log(`Server running on ${PORT}`));
+app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
