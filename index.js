@@ -5,7 +5,7 @@ const NGUONC_API = 'https://phim.nguonc.com/api';
 
 const builder = new addonBuilder({
     id: 'org.nguonc.stremio.official',
-    version: '2.0.0',
+    version: '2.1.0',
     name: 'NguonC Full Multi-Catalog & Stream',
     description: 'Xem đầy đủ Phim Lẻ, Phim Bộ, Hoạt Hình và TV Shows Vietsub từ NguonC',
     resources: ['catalog', 'meta', 'stream'],
@@ -155,7 +155,7 @@ builder.defineMetaHandler(async ({ type, id }) => {
     }
 });
 
-// 3. Stream Handler (BẮT BUỘC PHÁT TRỰC TIẾP TRÊN STREMIO)
+// 3. Stream Handler (THÊM BEHAVIOR HINTS & REFERER PROXY DÀNH CHO NGUONC)
 builder.defineStreamHandler(async ({ type, id }) => {
     try {
         let slug = id;
@@ -210,13 +210,22 @@ builder.defineStreamHandler(async ({ type, id }) => {
             }
 
             if (targetEp) {
-                // Ưu tiên lấy trực tiếp link m3u8
-                const streamUrl = targetEp.m3u8 || targetEp.link_m3u8 || targetEp.embed || targetEp.link_embed;
+                const streamUrl = targetEp.m3u8 || targetEp.link_m3u8;
                 if (streamUrl) {
                     streams.push({
                         name: `[NguonC] ${serverName}`,
-                        title: `${movie?.name || 'Phim'}\n${targetEp.name ? 'Tập ' + targetEp.name : 'Full'} - [In-App Player]`,
-                        url: streamUrl
+                        title: `${movie?.name || 'Phim'}\n${targetEp.name ? 'Tập ' + targetEp.name : 'Full'} - Full HD`,
+                        url: streamUrl,
+                        behaviorHints: {
+                            notSupported: false,
+                            proxyHeaders: {
+                                request: {
+                                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                                    "Referer": "https://phim.nguonc.com/",
+                                    "Origin": "https://phim.nguonc.com"
+                                }
+                            }
+                        }
                     });
                 }
             }
