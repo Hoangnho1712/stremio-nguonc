@@ -5,7 +5,7 @@ const NGUONC_API = 'https://phim.nguonc.com/api';
 
 const builder = new addonBuilder({
     id: 'org.nguonc.stremio.official',
-    version: '1.8.0',
+    version: '1.9.0',
     name: 'NguonC Full Multi-Catalog & Stream',
     description: 'Xem đầy đủ Phim Lẻ, Phim Bộ, Hoạt Hình và TV Shows Vietsub từ NguonC',
     resources: ['catalog', 'meta', 'stream'],
@@ -51,18 +51,15 @@ const builder = new addonBuilder({
     ]
 });
 
-// Hàm gọi API NguonC tối giản, chống timeout
 async function fetchNguonC(endpoint) {
     try {
         const res = await axios.get(`${NGUONC_API}${endpoint}`, { timeout: 10000 });
         return res.data;
     } catch (err) {
-        console.error(`Fetch Error [${endpoint}]:`, err.message);
         return null;
     }
 }
 
-// Chuyển IMDb ID -> Tên phim qua API Cinemeta
 async function getMovieTitleFromImdb(type, imdbId) {
     try {
         const reqType = type === 'anime' ? 'series' : type;
@@ -73,11 +70,10 @@ async function getMovieTitleFromImdb(type, imdbId) {
     }
 }
 
-// 1. Catalog Handler (Phân trang chuẩn 20 phim/lần cuộn)
+// 1. Catalog Handler
 builder.defineCatalogHandler(async ({ type, id, extra }) => {
     try {
         const skip = (extra && extra.skip) ? parseInt(extra.skip, 10) : 0;
-        // API NguonC trả 10 phim/trang, tính trang tương ứng với skip
         const page = Math.floor(skip / 10) + 1;
 
         let endpoint = `/films/phim-moi-cap-nhat?page=${page}`;
@@ -113,7 +109,7 @@ builder.defineCatalogHandler(async ({ type, id, extra }) => {
     }
 });
 
-// 2. Meta Handler (Lấy danh sách tập phim)
+// 2. Meta Handler
 builder.defineMetaHandler(async ({ type, id }) => {
     try {
         if (!id.startsWith('nguonc_')) return { meta: null };
@@ -159,24 +155,26 @@ builder.defineMetaHandler(async ({ type, id }) => {
     }
 });
 
-// 3. Stream Handler (Lấy link m3u8 chuẩn 100%)
+// 3. Stream Handler (Đã tối ưu hóa tìm kiếm link stream)
 builder.defineStreamHandler(async ({ type, id }) => {
     try {
         let slug = id;
-        let episode = 1;
+        let episodeTarget = 1;
 
+        // Xử lý ID dạng nguonc_slug:episode
         if (id.startsWith('nguonc_')) {
             const rawId = id.replace('nguonc_', '');
             const parts = rawId.split(':');
             slug = parts[0];
             if (parts.length > 1) {
-                episode = parseInt(parts[1], 10) || 1;
+                episodeTarget = parseInt(parts[1], 10) || 1;
             }
         } else if (id.startsWith('tt')) {
+            // Xử lý ID dạng IMDb tt123456:1:1
             const parts = id.split(':');
             const imdbId = parts[0];
             if (parts.length > 1) {
-                episode = parseInt(parts[2], 10) || 1;
+                episodeTarget = parseInt(parts[2], 10) || 1;
             }
 
             const movieTitle = await getMovieTitleFromImdb(type, imdbId);
@@ -202,25 +200,37 @@ builder.defineStreamHandler(async ({ type, id }) => {
             const serverName = server.server_name || server.name || 'NguonC';
             const epItems = server.items || server.server_data || [];
 
-            let targetEp = null;
-            if (type === 'series' || type === 'anime' || id.includes(':')) {
-                targetEp = epItems.find(ep => 
-                    ep.name == episode || 
-                    ep.slug == `tap-${episode}` ||
-                    ep.name == `Tập ${episode}`
-                ) || epItems[episode - 1] || epItems[0];
-            } else {
-                targetEp = epItems[0];
+            if (epItems.length === 0) continue;
+
+            // Tìm tập phù hợp
+            let targetEp = epItems.find(ep => {
+                const epNum = parseInt(ep.name, 10) || parseInt(ep.slug?.replace(/\D/g, ''), 10);
+                return epNum === episodeTarget;
+            });
+
+            // Nếu không tìm thấy chính xác tập, lấy theo vị trí index hoặc tập đầu
+            if (!targetEp) {
+                targetEp = epItems[episodeTarget - 1] || epItems[0];
             }
 
             if (targetEp) {
-                const streamUrl = targetEp.m3u8 || targetEp.link_m3u8 || targetEp.link_embed;
+                const streamUrl = targetEp.m3u8 || targetEp.link_m3u8 || targetEp.embed || targetEp.link_embed;
                 if (streamUrl) {
-                    streams.push({
-                        name: `[NguonC] ${serverName}`,
-                        title: `${movie?.name || 'Phim'}\n${targetEp.name ? 'Tập ' + targetEp.name : 'Full'} - Full HD`,
-                        url: streamUrl
-                    });
+                    // Nếu là link iframe/embed, thêm dạng externalUrl
+                    if (streamUrl.includes('embed') || !streamUrl.endsWith('.m3u8')) {
+                        streams.push({
+                            name: `[NguonC] ${serverName} (Web)`,
+                            title: `${movie?.name || 'Phim'}\n${targetEp.name ? 'Tập ' + targetEp.name : 'Full'} - Bấm để mở trình duyệt`,
+                            externalUrl: streamUrl
+                        });
+                    } else {
+                        // Link m3u8 phát trực tiếp trong Stremio
+                        streams.push({
+                            name: `[NguonC] ${serverName}`,
+                            title: `${movie?.name || 'Phim'}\n${targetEp.name ? 'Tập ' + targetEp.name : 'Full'} - Full HD`,
+                            url: streamUrl
+                        });
+                    }
                 }
             }
         }
