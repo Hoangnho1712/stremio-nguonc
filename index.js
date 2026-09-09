@@ -10,7 +10,8 @@ const builder = new addonBuilder({
     description: 'Cung cấp nguồn phim Vietsub/Thuyết minh từ NguonC',
     resources: ['stream'],
     types: ['movie', 'series'],
-    idPrefixes: ['tt']
+    idPrefixes: ['tt'],
+    catalogs: [] // Thêm dòng này để sửa lỗi "manifest.catalogs must be an array"
 });
 
 async function fetchNguonC(endpoint) {
