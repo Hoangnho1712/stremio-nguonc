@@ -5,7 +5,7 @@ const NGUONC_API = 'https://phim.nguonc.com/api';
 
 const builder = new addonBuilder({
     id: 'org.nguonc.stremio.official',
-    version: '1.7.0',
+    version: '1.8.0',
     name: 'NguonC Full Multi-Catalog & Stream',
     description: 'Xem đầy đủ Phim Lẻ, Phim Bộ, Hoạt Hình và TV Shows Vietsub từ NguonC',
     resources: ['catalog', 'meta', 'stream'],
@@ -16,45 +16,53 @@ const builder = new addonBuilder({
             type: 'movie',
             id: 'nguonc_movies',
             name: 'NguonC - Phim Lẻ',
-            extra: [{ name: 'search' }, { name: 'skip' }],
-            extraSupported: ['search', 'skip']
+            extra: [
+                { name: 'search', isRequired: false },
+                { name: 'skip', isRequired: false }
+            ]
         },
         {
             type: 'series',
             id: 'nguonc_series',
             name: 'NguonC - Phim Bộ',
-            extra: [{ name: 'search' }, { name: 'skip' }],
-            extraSupported: ['search', 'skip']
+            extra: [
+                { name: 'search', isRequired: false },
+                { name: 'skip', isRequired: false }
+            ]
         },
         {
             type: 'anime',
             id: 'nguonc_hoathinh',
             name: 'NguonC - Hoạt Hình',
-            extra: [{ name: 'search' }, { name: 'skip' }],
-            extraSupported: ['search', 'skip']
+            extra: [
+                { name: 'search', isRequired: false },
+                { name: 'skip', isRequired: false }
+            ]
         },
         {
             type: 'series',
             id: 'nguonc_tvshows',
             name: 'NguonC - TV Shows',
-            extra: [{ name: 'search' }, { name: 'skip' }],
-            extraSupported: ['search', 'skip']
+            extra: [
+                { name: 'search', isRequired: false },
+                { name: 'skip', isRequired: false }
+            ]
         }
     ]
 });
 
+// Hàm gọi API NguonC tối giản, chống timeout
 async function fetchNguonC(endpoint) {
     try {
-        const res = await axios.get(`${NGUONC_API}${endpoint}`, { 
-            timeout: 10000,
-            headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' }
-        });
+        const res = await axios.get(`${NGUONC_API}${endpoint}`, { timeout: 10000 });
         return res.data;
     } catch (err) {
+        console.error(`Fetch Error [${endpoint}]:`, err.message);
         return null;
     }
 }
 
+// Chuyển IMDb ID -> Tên phim qua API Cinemeta
 async function getMovieTitleFromImdb(type, imdbId) {
     try {
         const reqType = type === 'anime' ? 'series' : type;
@@ -65,10 +73,11 @@ async function getMovieTitleFromImdb(type, imdbId) {
     }
 }
 
-// 1. Catalog Handler
+// 1. Catalog Handler (Phân trang chuẩn 20 phim/lần cuộn)
 builder.defineCatalogHandler(async ({ type, id, extra }) => {
     try {
         const skip = (extra && extra.skip) ? parseInt(extra.skip, 10) : 0;
+        // API NguonC trả 10 phim/trang, tính trang tương ứng với skip
         const page = Math.floor(skip / 10) + 1;
 
         let endpoint = `/films/phim-moi-cap-nhat?page=${page}`;
@@ -104,7 +113,7 @@ builder.defineCatalogHandler(async ({ type, id, extra }) => {
     }
 });
 
-// 2. Meta Handler
+// 2. Meta Handler (Lấy danh sách tập phim)
 builder.defineMetaHandler(async ({ type, id }) => {
     try {
         if (!id.startsWith('nguonc_')) return { meta: null };
@@ -150,7 +159,7 @@ builder.defineMetaHandler(async ({ type, id }) => {
     }
 });
 
-// 3. Stream Handler (Đã fix triệt để lỗi không tìm thấy luồng)
+// 3. Stream Handler (Lấy link m3u8 chuẩn 100%)
 builder.defineStreamHandler(async ({ type, id }) => {
     try {
         let slug = id;
