@@ -5,7 +5,7 @@ const NGUONC_API = 'https://phim.nguonc.com/api';
 
 const builder = new addonBuilder({
     id: 'org.nguonc.stremio.official',
-    version: '2.1.0',
+    version: '2.2.0',
     name: 'NguonC Full Multi-Catalog & Stream',
     description: 'Xem đầy đủ Phim Lẻ, Phim Bộ, Hoạt Hình và TV Shows Vietsub từ NguonC',
     resources: ['catalog', 'meta', 'stream'],
@@ -16,37 +16,25 @@ const builder = new addonBuilder({
             type: 'movie',
             id: 'nguonc_movies',
             name: 'NguonC - Phim Lẻ',
-            extra: [
-                { name: 'search', isRequired: false },
-                { name: 'skip', isRequired: false }
-            ]
+            extra: [{ name: 'search', isRequired: false }, { name: 'skip', isRequired: false }]
         },
         {
             type: 'series',
             id: 'nguonc_series',
             name: 'NguonC - Phim Bộ',
-            extra: [
-                { name: 'search', isRequired: false },
-                { name: 'skip', isRequired: false }
-            ]
+            extra: [{ name: 'search', isRequired: false }, { name: 'skip', isRequired: false }]
         },
         {
             type: 'anime',
             id: 'nguonc_hoathinh',
             name: 'NguonC - Hoạt Hình',
-            extra: [
-                { name: 'search', isRequired: false },
-                { name: 'skip', isRequired: false }
-            ]
+            extra: [{ name: 'search', isRequired: false }, { name: 'skip', isRequired: false }]
         },
         {
             type: 'series',
             id: 'nguonc_tvshows',
             name: 'NguonC - TV Shows',
-            extra: [
-                { name: 'search', isRequired: false },
-                { name: 'skip', isRequired: false }
-            ]
+            extra: [{ name: 'search', isRequired: false }, { name: 'skip', isRequired: false }]
         }
     ]
 });
@@ -77,16 +65,10 @@ builder.defineCatalogHandler(async ({ type, id, extra }) => {
         const page = Math.floor(skip / 10) + 1;
 
         let endpoint = `/films/phim-moi-cap-nhat?page=${page}`;
-
-        if (id === 'nguonc_movies') {
-            endpoint = `/films/danh-sach/phim-le?page=${page}`;
-        } else if (id === 'nguonc_series') {
-            endpoint = `/films/danh-sach/phim-bo?page=${page}`;
-        } else if (id === 'nguonc_hoathinh') {
-            endpoint = `/films/danh-sach/hoat-hinh?page=${page}`;
-        } else if (id === 'nguonc_tvshows') {
-            endpoint = `/films/danh-sach/tv-shows?page=${page}`;
-        }
+        if (id === 'nguonc_movies') endpoint = `/films/danh-sach/phim-le?page=${page}`;
+        else if (id === 'nguonc_series') endpoint = `/films/danh-sach/phim-bo?page=${page}`;
+        else if (id === 'nguonc_hoathinh') endpoint = `/films/danh-sach/hoat-hinh?page=${page}`;
+        else if (id === 'nguonc_tvshows') endpoint = `/films/danh-sach/tv-shows?page=${page}`;
 
         if (extra && extra.search) {
             endpoint = `/films/search?keyword=${encodeURIComponent(extra.search)}`;
@@ -113,7 +95,7 @@ builder.defineCatalogHandler(async ({ type, id, extra }) => {
 builder.defineMetaHandler(async ({ type, id }) => {
     try {
         if (!id.startsWith('nguonc_')) return { meta: null };
-        
+
         const rawId = id.replace('nguonc_', '');
         const slug = rawId.split(':')[0];
 
@@ -155,7 +137,7 @@ builder.defineMetaHandler(async ({ type, id }) => {
     }
 });
 
-// 3. Stream Handler (THÊM BEHAVIOR HINTS & REFERER PROXY DÀNH CHO NGUONC)
+// 3. Stream Handler (Fix triệt để tìm kiếm luồng & fallback)
 builder.defineStreamHandler(async ({ type, id }) => {
     try {
         let slug = id;
@@ -198,8 +180,9 @@ builder.defineStreamHandler(async ({ type, id }) => {
             const serverName = server.server_name || server.name || 'NguonC';
             const epItems = server.items || server.server_data || [];
 
-            if (epItems.length === 0) continue;
+            if (!epItems || epItems.length === 0) continue;
 
+            // Tìm tập tương ứng
             let targetEp = epItems.find(ep => {
                 const epNum = parseInt(ep.name, 10) || parseInt(ep.slug?.replace(/\D/g, ''), 10);
                 return epNum === episodeTarget;
@@ -210,12 +193,15 @@ builder.defineStreamHandler(async ({ type, id }) => {
             }
 
             if (targetEp) {
-                const streamUrl = targetEp.m3u8 || targetEp.link_m3u8;
-                if (streamUrl) {
+                const m3u8Url = targetEp.m3u8 || targetEp.link_m3u8;
+                const embedUrl = targetEp.embed || targetEp.link_embed;
+
+                // 1. Luồng Direct Stream M3U8 (Chạy trực tiếp Stremio Player)
+                if (m3u8Url) {
                     streams.push({
                         name: `[NguonC] ${serverName}`,
-                        title: `${movie?.name || 'Phim'}\n${targetEp.name ? 'Tập ' + targetEp.name : 'Full'} - Full HD`,
-                        url: streamUrl,
+                        title: `${movie?.name || 'Phim'}\n${targetEp.name ? 'Tập ' + targetEp.name : 'Full'} - Auto Player`,
+                        url: m3u8Url,
                         behaviorHints: {
                             notSupported: false,
                             proxyHeaders: {
@@ -226,6 +212,15 @@ builder.defineStreamHandler(async ({ type, id }) => {
                                 }
                             }
                         }
+                    });
+                }
+
+                // 2. Luồng Fallback Web Embed (Phòng trường hợp m3u8 bị chết/chặn)
+                if (embedUrl && embedUrl !== m3u8Url) {
+                    streams.push({
+                        name: `[NguonC-Web] ${serverName}`,
+                        title: `${movie?.name || 'Phim'}\n${targetEp.name ? 'Tập ' + targetEp.name : 'Full'} - Link Web Dự Phòng`,
+                        externalUrl: embedUrl
                     });
                 }
             }
