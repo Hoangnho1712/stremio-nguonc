@@ -4,20 +4,18 @@ const axios = require('axios');
 
 const NGUONC_API = 'https://phim.nguonc.com/api';
 const PORT = process.env.PORT || 7000;
-// CẤU HÌNH ĐÚNG TÊN MIỀN RENDER CỦA BẠN (ÉP CHUẨN HTTPS CHO IPHONE)
-const RENDER_HOST = process.env.RENDER_EXTERNAL_URL || 'https://stremio-nguonc-1.onrender.com';
 
 const FAKE_HEADERS = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
     'Referer': 'https://phim.nguonc.com/',
     'Origin': 'https://phim.nguonc.com'
 };
 
 const builder = new addonBuilder({
-    id: 'org.nguonc.stremio.v84',
-    version: '8.4.0',
-    name: 'NguonC Pro Stream',
-    description: 'NguonC Direct + Proxy sửa lỗi HTTPS cho iOS',
+    id: 'org.nguonc.stremio.v86',
+    version: '8.6.0',
+    name: 'NguonC Siêu Nhẹ',
+    description: 'Chỉ Direct + NguonC Web (Đã xóa bỏ Proxy lỗi)',
     resources: ['catalog', 'meta', 'stream'],
     types: ['movie', 'series', 'anime'],
     idPrefixes: ['tt', 'nguonc_'],
@@ -129,7 +127,7 @@ builder.defineStreamHandler(async ({ type, id }) => {
             const items = searchData?.items || searchData?.data?.items || searchData?.data || [];
             if (!items || items.length === 0) {
                 const fallback = await fetchFallbackStream(slug, episodeTarget);
-                if (fallback) return { streams: [{ name: `[${fallback.source}]`, title: `Tập ${episodeTarget} - Dự phòng`, url: fallback.url }] };
+                if (fallback) return { streams: [{ name: `[${fallback.source}] Direct`, title: `Tập ${episodeTarget} - Bấm là xem`, url: fallback.url }] };
                 return { streams: [] };
             }
             slug = items[0].slug;
@@ -153,7 +151,7 @@ builder.defineStreamHandler(async ({ type, id }) => {
 
                 if (!directM3u8 && embedUrl) {
                     try {
-                        const res = await axios.get(embedUrl, { headers: FAKE_HEADERS, timeout: 8000 });
+                        const res = await axios.get(embedUrl, { headers: FAKE_HEADERS, timeout: 5000 });
                         directM3u8 = extractM3U8(res.data);
                     } catch (e) {}
                 }
@@ -162,72 +160,38 @@ builder.defineStreamHandler(async ({ type, id }) => {
                     const fallback = await fetchFallbackStream(slug, episodeTarget);
                     if (fallback) {
                         directM3u8 = fallback.url; 
-                        sourceLabel = `${fallback.source} (Bù)`;
+                        sourceLabel = fallback.source;
                     }
                 }
 
+                // Luồng Direct chạy thẳng trên app Stremio
                 if (directM3u8) {
                     streams.push({ 
-                        name: `[${sourceLabel}] Proxy`, 
-                        title: `Tập ${targetEp.name || episodeTarget} - Khắc phục nghẽn mạng`, 
-                        url: `${RENDER_HOST}/proxy-m3u8?url=${encodeURIComponent(directM3u8)}` 
-                    });
-                    streams.push({ 
                         name: `[${sourceLabel}] Direct`, 
-                        title: `Tập ${targetEp.name || episodeTarget} - Tốc độ gốc`, 
+                        title: `Tập ${targetEp.name || episodeTarget} - Tốc độ cao (Xem ngay)`, 
                         url: directM3u8, 
                         behaviorHints: { requestHeaders: { "Referer": "https://phim.nguonc.com/", "Origin": "https://phim.nguonc.com/" } } 
                     });
                 }
-                if (embedUrl) streams.push({ name: `[NguonC] Web`, title: `Tập ${targetEp.name || episodeTarget} - Mở qua trình duyệt`, externalUrl: embedUrl });
+
+                // Luồng Web dự phòng để mở qua trình duyệt
+                if (embedUrl) {
+                    streams.push({ 
+                        name: `[NguonC] Web`, 
+                        title: `Tập ${targetEp.name || episodeTarget} - Mở qua trình duyệt web`, 
+                        externalUrl: embedUrl 
+                    });
+                }
             }
         }
         return { streams: streams };
     } catch (e) { return { streams: [] }; }
 });
 
-// KHỞI CHẠY PROXY SERVER
 const app = express();
-app.set('trust proxy', true);
 app.use((req, res, next) => { 
     res.setHeader('Access-Control-Allow-Origin', '*'); 
-    res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', '*');
     next(); 
-});
-
-app.get('/proxy-m3u8', async (req, res) => {
-    try {
-        let targetUrl = req.query.url;
-        const response = await axios.get(targetUrl, { headers: FAKE_HEADERS, timeout: 10000 });
-        const finalUrl = response.request?.res?.responseUrl || targetUrl;
-
-        let m3u8Content = typeof response.data === 'string' ? response.data : JSON.stringify(response.data);
-        m3u8Content = m3u8Content.replace(/URI="(.*?)"/g, (match, p1) => `URI="${RENDER_HOST}/proxy-ts?url=${encodeURIComponent(new URL(p1, finalUrl).href)}"`);
-        
-        const proxiedLines = m3u8Content.split('\n').map(line => {
-            const tLine = line.trim();
-            if (!tLine || tLine.startsWith('#')) return line;
-            const absUrl = new URL(tLine, finalUrl).href;
-            return absUrl.includes('.m3u8') ? `${RENDER_HOST}/proxy-m3u8?url=${encodeURIComponent(absUrl)}` : `${RENDER_HOST}/proxy-ts?url=${encodeURIComponent(absUrl)}`;
-        });
-        res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
-        res.send(proxiedLines.join('\n'));
-    } catch (e) { res.status(500).send('M3U8 Error'); }
-});
-
-app.get('/proxy-ts', async (req, res) => {
-    try {
-        const response = await axios({ 
-            method: 'get', 
-            url: req.query.url, 
-            responseType: 'stream', 
-            headers: FAKE_HEADERS, 
-            timeout: 20000 
-        });
-        res.setHeader('Content-Type', response.headers['content-type'] || 'video/mp2t');
-        response.data.pipe(res);
-    } catch (e) { res.status(500).send('TS Error'); }
 });
 
 const addonRouter = getRouter(builder.getInterface());
