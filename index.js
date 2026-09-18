@@ -5,25 +5,17 @@ const axios = require('axios');
 const NGUONC_API = 'https://phim.nguonc.com/api';
 const PORT = process.env.PORT || 7000;
 
-// BỘ GIẢ LẬP TRÌNH DUYỆT ĐỂ LỪA HỆ THỐNG BẢO VỆ NGUONC
 const FAKE_HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
-    'Accept-Language': 'vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7',
-    'Sec-Ch-Ua': '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
-    'Sec-Ch-Ua-Mobile': '?0',
-    'Sec-Ch-Ua-Platform': '"Windows"',
-    'Sec-Fetch-Dest': 'document',
-    'Sec-Fetch-Mode': 'navigate',
-    'Sec-Fetch-Site': 'cross-site',
-    'Upgrade-Insecure-Requests': '1'
+    'Referer': 'https://phim.nguonc.com/',
+    'Origin': 'https://phim.nguonc.com'
 };
 
 const builder = new addonBuilder({
-    id: 'org.nguonc.stremio.v82',
-    version: '8.2.0',
-    name: 'NguonC Pro Stream',
-    description: 'Bypass Embed NguonC + Lấy link Direct trực tiếp',
+    id: 'org.nguonc.stremio.v83',
+    version: '8.3.0',
+    name: 'NguonC Pro Max',
+    description: 'Vượt Cloudflare StreamC + Bẻ khóa Hash lấy link gốc NguonC',
     resources: ['catalog', 'meta', 'stream'],
     types: ['movie', 'series', 'anime'],
     idPrefixes: ['tt', 'nguonc_'],
@@ -35,7 +27,7 @@ const builder = new addonBuilder({
 });
 
 async function fetchNguonC(endpoint) {
-    try { const res = await axios.get(`${NGUONC_API}${endpoint}`, { timeout: 10000, headers: FAKE_HEADERS }); return res.data; }
+    try { const res = await axios.get(`${NGUONC_API}${endpoint}`, { timeout: 10000 }); return res.data; }
     catch (err) { return null; }
 }
 
@@ -47,18 +39,15 @@ async function getMovieTitleFromImdb(type, imdbId) {
     } catch (err) { return null; }
 }
 
-// THUẬT TOÁN QUÉT SÂU JAVASCRIPT ĐỂ BÓC M3U8
 function extractM3U8(data) {
     try {
         const str = typeof data === 'string' ? data : JSON.stringify(data);
         let decoded = str.replace(/\\u[\dA-F]{4}/gi, m => String.fromCharCode(parseInt(m.replace(/\\u/g, ''), 16)));
         decoded = decoded.replace(/\\\//g, '/');
 
-        // Bắt link trực tiếp
         let match = decoded.match(/(?:https?:)?\/\/[^"'\s<>\[\]{}()]+\.m3u8[^"'\s<>\[\]{}()]*/i);
         if (match) return match[0].startsWith('//') ? 'https:' + match[0] : match[0];
 
-        // Bắt link bị mã hóa Base64
         let b64Matches = decoded.match(/(aHR0c[A-Za-z0-9+/=]+)/g);
         if (b64Matches) {
             for (let b64 of b64Matches) {
@@ -73,7 +62,6 @@ function extractM3U8(data) {
     return null;
 }
 
-// Hàm lấy link bù trừ (phòng khi bypass thất bại)
 async function fetchFallbackStream(slug, episodeTarget) {
     const fallbackApis = [`https://phimapi.com/phim/${slug}`, `https://ophim1.com/phim/${slug}`];
     for (const apiUrl of fallbackApis) {
@@ -101,9 +89,7 @@ builder.defineCatalogHandler(async ({ type, id, extra }) => {
         if (id === 'nguonc_movies') endpoint = `/films/danh-sach/phim-le?page=${page}`;
         else if (id === 'nguonc_series') endpoint = `/films/danh-sach/phim-bo?page=${page}`;
         else if (id === 'nguonc_hoathinh') endpoint = `/films/danh-sach/hoat-hinh?page=${page}`;
-        
         if (extra && extra.search) endpoint = `/films/search?keyword=${encodeURIComponent(extra.search)}&page=${page}`;
-
         const data = await fetchNguonC(endpoint);
         const items = data?.items || data?.data?.items || data?.data || [];
         return { metas: items.map(item => ({ id: `nguonc_${item.slug}`, type, name: item.name, poster: item.poster_url || item.thumb_url, description: item.original_name || item.name })) };
@@ -117,7 +103,6 @@ builder.defineMetaHandler(async ({ type, id }) => {
         const detailData = await fetchNguonC(`/film/${slug}`);
         const movie = detailData?.movie || detailData?.film;
         if (!movie) return { meta: null };
-
         const servers = movie.episodes || detailData?.episodes || [];
         const episodesList = [];
         if (servers.length > 0) {
@@ -165,44 +150,69 @@ builder.defineStreamHandler(async ({ type, id }) => {
                 const embedUrl = targetEp.embed || targetEp.link_embed || "";
                 let sourceLabel = "NguonC Gốc";
 
-                // CHIẾN DỊCH VƯỢT RÀO VÀO TRANG EMBED
                 if (!directM3u8 && embedUrl) {
-                    try {
-                        const embedHeaders = { ...FAKE_HEADERS, 'Referer': 'https://phim.nguonc.com/' };
-                        const res = await axios.get(embedUrl, { headers: embedHeaders, timeout: 8000 });
-                        directM3u8 = extractM3U8(res.data);
-                    } catch (e) {
-                        console.error("Cloudflare chặn Server Render hoặc lỗi Timeout");
+                    // CHIẾN DỊCH 1: Dịch ngược M3U8 trực tiếp từ đoạn Hash của link StreamC
+                    if (embedUrl.includes('streamc.xyz/embed.php?hash=')) {
+                        const hash = embedUrl.split('hash=')[1].split('&')[0];
+                        const domain = embedUrl.split('/embed.php')[0];
+                        // Xây dựng các cấu trúc thư mục CDN phổ biến
+                        const guessedUrls = [
+                            `${domain}/hls/${hash}/index.m3u8`,
+                            `${domain}/hls/${hash}/playlist.m3u8`
+                        ];
+                        for (let gUrl of guessedUrls) {
+                            try {
+                                await axios.head(gUrl, { timeout: 3000 });
+                                directM3u8 = gUrl; sourceLabel = "NguonC (Bypass Hash)";
+                                break;
+                            } catch(e) {}
+                        }
+                    }
+
+                    // CHIẾN DỊCH 2: Dùng AllOrigins Proxy lừa Cloudflare nếu máy chủ Render bị chặn
+                    if (!directM3u8) {
+                        try {
+                            const proxyUrl = `https://api.allorigins.win/get?url=${encodeURIComponent(embedUrl)}`;
+                            const res = await axios.get(proxyUrl, { timeout: 8000 });
+                            if (res.data && res.data.contents) {
+                                directM3u8 = extractM3U8(res.data.contents);
+                                if (directM3u8) sourceLabel = "NguonC (Qua Web Proxy)";
+                            }
+                        } catch (e) {}
+                    }
+                    
+                    // CHIẾN DỊCH 3: Cào chay truyền thống
+                    if (!directM3u8) {
+                        try {
+                            const res = await axios.get(embedUrl, { headers: FAKE_HEADERS, timeout: 8000 });
+                            directM3u8 = extractM3U8(res.data);
+                        } catch (e) {}
                     }
                 }
 
-                // Nếu Vượt rào thất bại do Cloudflare/IP lock, dùng link thay thế
                 if (!directM3u8) {
                     const fallback = await fetchFallbackStream(slug, episodeTarget);
                     if (fallback) {
-                        directM3u8 = fallback.url;
-                        sourceLabel = `${fallback.source} (Bù NguonC)`;
+                        directM3u8 = fallback.url; sourceLabel = `${fallback.source} (Bù NguonC)`;
                     }
                 }
 
                 if (directM3u8) {
                     streams.push({ 
                         name: `[${sourceLabel}] Proxy`, 
-                        title: `Tập ${targetEp.name || episodeTarget} - Xem mượt qua Render`, 
+                        title: `Tập ${targetEp.name || episodeTarget} - Tăng tốc độ`, 
                         url: `${renderHost}/proxy-m3u8?url=${encodeURIComponent(directM3u8)}` 
                     });
                     streams.push({ 
                         name: `[${sourceLabel}] Direct`, 
                         title: `Tập ${targetEp.name || episodeTarget} - Tốc độ gốc`, 
                         url: directM3u8, 
-                        behaviorHints: { requestHeaders: { "Referer": "https://phim.nguonc.com/", "Origin": "https://phim.nguonc.com/" } } 
+                        behaviorHints: { requestHeaders: { "Referer": "https://embed13.streamc.xyz/", "Origin": "https://embed13.streamc.xyz/" } } 
                     });
                 }
-
                 if (embedUrl) streams.push({ name: `[NguonC] Web`, title: `Tập ${targetEp.name || episodeTarget} - Mở qua trình duyệt`, externalUrl: embedUrl });
             }
         }
-
         return { streams: streams };
     } catch (e) { return { streams: [] }; }
 });
@@ -216,10 +226,8 @@ app.get('/proxy-m3u8', async (req, res) => {
         const response = await axios.get(targetUrl, { headers: FAKE_HEADERS, timeout: 10000 });
         const finalUrl = response.request?.res?.responseUrl || targetUrl;
         const hostUrl = `${req.protocol}://${req.get('host')}`;
-
         let m3u8Content = typeof response.data === 'string' ? response.data : JSON.stringify(response.data);
         m3u8Content = m3u8Content.replace(/URI="(.*?)"/g, (match, p1) => `URI="${hostUrl}/proxy-ts?url=${encodeURIComponent(new URL(p1, finalUrl).href)}"`);
-
         const proxiedLines = m3u8Content.split('\n').map(line => {
             const tLine = line.trim();
             if (!tLine || tLine.startsWith('#')) return line;
