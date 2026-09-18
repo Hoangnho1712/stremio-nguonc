@@ -4,6 +4,8 @@ const axios = require('axios');
 
 const NGUONC_API = 'https://phim.nguonc.com/api';
 const PORT = process.env.PORT || 7000;
+// CẤU HÌNH ĐÚNG TÊN MIỀN RENDER CỦA BẠN (ÉP CHUẨN HTTPS CHO IPHONE)
+const RENDER_HOST = process.env.RENDER_EXTERNAL_URL || 'https://stremio-nguonc-1.onrender.com';
 
 const FAKE_HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
@@ -12,10 +14,10 @@ const FAKE_HEADERS = {
 };
 
 const builder = new addonBuilder({
-    id: 'org.nguonc.stremio.v83',
-    version: '8.3.0',
-    name: 'NguonC Pro Max',
-    description: 'Vượt Cloudflare StreamC + Bẻ khóa Hash lấy link gốc NguonC',
+    id: 'org.nguonc.stremio.v84',
+    version: '8.4.0',
+    name: 'NguonC Pro Stream',
+    description: 'NguonC Direct + Proxy sửa lỗi HTTPS cho iOS',
     resources: ['catalog', 'meta', 'stream'],
     types: ['movie', 'series', 'anime'],
     idPrefixes: ['tt', 'nguonc_'],
@@ -136,7 +138,6 @@ builder.defineStreamHandler(async ({ type, id }) => {
         const detailData = await fetchNguonC(`/film/${slug}`);
         const servers = detailData?.movie?.episodes || detailData?.episodes || [];
         const streams = [];
-        const renderHost = process.env.RENDER_EXTERNAL_URL || 'https://stremio-nguonc-1.onrender.com';
 
         for (const server of servers) {
             const epItems = server.items || server.server_data || [];
@@ -148,66 +149,34 @@ builder.defineStreamHandler(async ({ type, id }) => {
             if (targetEp) {
                 let directM3u8 = targetEp.m3u8_link || targetEp.link_m3u8 || extractM3U8(targetEp);
                 const embedUrl = targetEp.embed || targetEp.link_embed || "";
-                let sourceLabel = "NguonC Gốc";
+                let sourceLabel = "NguonC";
 
                 if (!directM3u8 && embedUrl) {
-                    // CHIẾN DỊCH 1: Dịch ngược M3U8 trực tiếp từ đoạn Hash của link StreamC
-                    if (embedUrl.includes('streamc.xyz/embed.php?hash=')) {
-                        const hash = embedUrl.split('hash=')[1].split('&')[0];
-                        const domain = embedUrl.split('/embed.php')[0];
-                        // Xây dựng các cấu trúc thư mục CDN phổ biến
-                        const guessedUrls = [
-                            `${domain}/hls/${hash}/index.m3u8`,
-                            `${domain}/hls/${hash}/playlist.m3u8`
-                        ];
-                        for (let gUrl of guessedUrls) {
-                            try {
-                                await axios.head(gUrl, { timeout: 3000 });
-                                directM3u8 = gUrl; sourceLabel = "NguonC (Bypass Hash)";
-                                break;
-                            } catch(e) {}
-                        }
-                    }
-
-                    // CHIẾN DỊCH 2: Dùng AllOrigins Proxy lừa Cloudflare nếu máy chủ Render bị chặn
-                    if (!directM3u8) {
-                        try {
-                            const proxyUrl = `https://api.allorigins.win/get?url=${encodeURIComponent(embedUrl)}`;
-                            const res = await axios.get(proxyUrl, { timeout: 8000 });
-                            if (res.data && res.data.contents) {
-                                directM3u8 = extractM3U8(res.data.contents);
-                                if (directM3u8) sourceLabel = "NguonC (Qua Web Proxy)";
-                            }
-                        } catch (e) {}
-                    }
-                    
-                    // CHIẾN DỊCH 3: Cào chay truyền thống
-                    if (!directM3u8) {
-                        try {
-                            const res = await axios.get(embedUrl, { headers: FAKE_HEADERS, timeout: 8000 });
-                            directM3u8 = extractM3U8(res.data);
-                        } catch (e) {}
-                    }
+                    try {
+                        const res = await axios.get(embedUrl, { headers: FAKE_HEADERS, timeout: 8000 });
+                        directM3u8 = extractM3U8(res.data);
+                    } catch (e) {}
                 }
 
                 if (!directM3u8) {
                     const fallback = await fetchFallbackStream(slug, episodeTarget);
                     if (fallback) {
-                        directM3u8 = fallback.url; sourceLabel = `${fallback.source} (Bù NguonC)`;
+                        directM3u8 = fallback.url; 
+                        sourceLabel = `${fallback.source} (Bù)`;
                     }
                 }
 
                 if (directM3u8) {
                     streams.push({ 
                         name: `[${sourceLabel}] Proxy`, 
-                        title: `Tập ${targetEp.name || episodeTarget} - Tăng tốc độ`, 
-                        url: `${renderHost}/proxy-m3u8?url=${encodeURIComponent(directM3u8)}` 
+                        title: `Tập ${targetEp.name || episodeTarget} - Khắc phục nghẽn mạng`, 
+                        url: `${RENDER_HOST}/proxy-m3u8?url=${encodeURIComponent(directM3u8)}` 
                     });
                     streams.push({ 
                         name: `[${sourceLabel}] Direct`, 
                         title: `Tập ${targetEp.name || episodeTarget} - Tốc độ gốc`, 
                         url: directM3u8, 
-                        behaviorHints: { requestHeaders: { "Referer": "https://embed13.streamc.xyz/", "Origin": "https://embed13.streamc.xyz/" } } 
+                        behaviorHints: { requestHeaders: { "Referer": "https://phim.nguonc.com/", "Origin": "https://phim.nguonc.com/" } } 
                     });
                 }
                 if (embedUrl) streams.push({ name: `[NguonC] Web`, title: `Tập ${targetEp.name || episodeTarget} - Mở qua trình duyệt`, externalUrl: embedUrl });
@@ -217,22 +186,30 @@ builder.defineStreamHandler(async ({ type, id }) => {
     } catch (e) { return { streams: [] }; }
 });
 
+// KHỞI CHẠY PROXY SERVER
 const app = express();
-app.use((req, res, next) => { res.setHeader('Access-Control-Allow-Origin', '*'); next(); });
+app.set('trust proxy', true);
+app.use((req, res, next) => { 
+    res.setHeader('Access-Control-Allow-Origin', '*'); 
+    res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', '*');
+    next(); 
+});
 
 app.get('/proxy-m3u8', async (req, res) => {
     try {
         let targetUrl = req.query.url;
         const response = await axios.get(targetUrl, { headers: FAKE_HEADERS, timeout: 10000 });
         const finalUrl = response.request?.res?.responseUrl || targetUrl;
-        const hostUrl = `${req.protocol}://${req.get('host')}`;
+
         let m3u8Content = typeof response.data === 'string' ? response.data : JSON.stringify(response.data);
-        m3u8Content = m3u8Content.replace(/URI="(.*?)"/g, (match, p1) => `URI="${hostUrl}/proxy-ts?url=${encodeURIComponent(new URL(p1, finalUrl).href)}"`);
+        m3u8Content = m3u8Content.replace(/URI="(.*?)"/g, (match, p1) => `URI="${RENDER_HOST}/proxy-ts?url=${encodeURIComponent(new URL(p1, finalUrl).href)}"`);
+        
         const proxiedLines = m3u8Content.split('\n').map(line => {
             const tLine = line.trim();
             if (!tLine || tLine.startsWith('#')) return line;
             const absUrl = new URL(tLine, finalUrl).href;
-            return absUrl.includes('.m3u8') ? `${hostUrl}/proxy-m3u8?url=${encodeURIComponent(absUrl)}` : `${hostUrl}/proxy-ts?url=${encodeURIComponent(absUrl)}`;
+            return absUrl.includes('.m3u8') ? `${RENDER_HOST}/proxy-m3u8?url=${encodeURIComponent(absUrl)}` : `${RENDER_HOST}/proxy-ts?url=${encodeURIComponent(absUrl)}`;
         });
         res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
         res.send(proxiedLines.join('\n'));
@@ -241,7 +218,13 @@ app.get('/proxy-m3u8', async (req, res) => {
 
 app.get('/proxy-ts', async (req, res) => {
     try {
-        const response = await axios({ method: 'get', url: req.query.url, responseType: 'stream', headers: FAKE_HEADERS, timeout: 15000 });
+        const response = await axios({ 
+            method: 'get', 
+            url: req.query.url, 
+            responseType: 'stream', 
+            headers: FAKE_HEADERS, 
+            timeout: 20000 
+        });
         res.setHeader('Content-Type', response.headers['content-type'] || 'video/mp2t');
         response.data.pipe(res);
     } catch (e) { res.status(500).send('TS Error'); }
