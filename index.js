@@ -6,10 +6,10 @@ const NGUONC_API = 'https://phim.nguonc.com/api';
 const PORT = process.env.PORT || 7000;
 
 const builder = new addonBuilder({
-    id: 'org.nguonc.stremio.v80',
-    version: '8.0.0',
-    name: 'NguonC Official Only',
-    description: 'Chỉ lấy link trực tiếp từ máy chủ gốc NguonC, không dùng server dự phòng.',
+    id: 'org.nguonc.stremio.v81',
+    version: '8.1.0',
+    name: 'NguonC Pro Stream',
+    description: 'NguonC Direct + Tự động phục hồi luồng khi NguonC thiếu link',
     resources: ['catalog', 'meta', 'stream'],
     types: ['movie', 'series', 'anime'],
     idPrefixes: ['tt', 'nguonc_'],
@@ -20,7 +20,6 @@ const builder = new addonBuilder({
     ]
 });
 
-// Hàm hỗ trợ
 async function fetchNguonC(endpoint) {
     try { const res = await axios.get(`${NGUONC_API}${endpoint}`, { timeout: 10000 }); return res.data; }
     catch (err) { return null; }
@@ -34,7 +33,6 @@ async function getMovieTitleFromImdb(type, imdbId) {
     } catch (err) { return null; }
 }
 
-// THUẬT TOÁN BÓC TÁCH M3U8 MÃ HÓA
 function extractM3U8(data) {
     try {
         const str = typeof data === 'string' ? data : JSON.stringify(data);
@@ -63,6 +61,31 @@ function extractM3U8(data) {
             }
         }
     } catch (e) {}
+    return null;
+}
+
+// Tìm link dự phòng khi NguonC không thể giải mã
+async function fetchFallbackStream(slug, episodeTarget, movieTitle) {
+    const fallbackApis = [
+        `https://phimapi.com/phim/${slug}`,
+        `https://ophim1.com/phim/${slug}`
+    ];
+    
+    // Nếu có tên phim, thử tìm kiếm trên KKPhim nếu slug không khớp
+    for (const apiUrl of fallbackApis) {
+        try {
+            const res = await axios.get(apiUrl, { timeout: 5000 });
+            const servers = res.data?.episodes || [];
+            for (const server of servers) {
+                const epItems = server.server_data || [];
+                let targetEp = epItems.find(ep => (parseInt(ep.name, 10) || parseInt(ep.slug?.replace(/\D/g, ''), 10)) === episodeTarget);
+                if (!targetEp) targetEp = epItems[episodeTarget - 1] || epItems[0];
+                if (targetEp && targetEp.link_m3u8 && targetEp.link_m3u8.includes('.m3u8')) {
+                    return { url: targetEp.link_m3u8, source: apiUrl.includes('phimapi') ? 'KKPhim' : 'Ophim' };
+                }
+            }
+        } catch (e) {}
+    }
     return null;
 }
 
@@ -102,20 +125,27 @@ builder.defineMetaHandler(async ({ type, id }) => {
     } catch (e) { return { meta: null }; }
 });
 
-// 3. STREAM HANDLER (NguonC Độc Lập)
+// 3. STREAM HANDLER
 builder.defineStreamHandler(async ({ type, id }) => {
     try {
-        let slug = id; let episodeTarget = 1;
+        let slug = id; let episodeTarget = 1; let movieTitle = '';
         if (id.startsWith('nguonc_')) {
             const parts = id.replace('nguonc_', '').split(':');
             slug = parts[0]; if (parts.length > 1) episodeTarget = parseInt(parts[1], 10) || 1;
         } else if (id.startsWith('tt')) {
             const parts = id.split(':'); if (type === 'series' && parts.length > 2) episodeTarget = parseInt(parts[2], 10) || 1;
-            const movieTitle = await getMovieTitleFromImdb(type, parts[0]);
+            movieTitle = await getMovieTitleFromImdb(type, parts[0]);
             if (!movieTitle) return { streams: [] };
             const searchData = await fetchNguonC(`/films/search?keyword=${encodeURIComponent(movieTitle)}`);
             const items = searchData?.items || searchData?.data?.items || searchData?.data || [];
-            if (!items || items.length === 0) return { streams: [] };
+            if (!items || items.length === 0) {
+                // Nếu NguonC không có phim, vẫn thử tìm fallback
+                const fallback = await fetchFallbackStream(slug, episodeTarget, movieTitle);
+                if (fallback) {
+                    return { streams: [{ name: `[${fallback.source}]`, title: `Tập ${episodeTarget} - Dự phòng khi NguonC thiếu link`, url: fallback.url }] };
+                }
+                return { streams: [] };
+            }
             slug = items[0].slug;
         }
 
@@ -132,9 +162,9 @@ builder.defineStreamHandler(async ({ type, id }) => {
             if (!targetEp) targetEp = epItems[episodeTarget - 1] || epItems[0];
 
             if (targetEp) {
-                // Ưu tiên bắt thẳng link m3u8 chuẩn của NguonC, không dùng dự phòng
-                let directM3u8 = targetEp.m3u8_link || targetEp.link_m3u8 || extractM3U8(targetEp);
+                let directM3u8 = extractM3U8(targetEp);
                 const embedUrl = targetEp.embed || targetEp.link_embed || "";
+                let sourceLabel = "NguonC Gốc";
 
                 if (!directM3u8 && embedUrl) {
                     try {
@@ -143,9 +173,31 @@ builder.defineStreamHandler(async ({ type, id }) => {
                     } catch (e) {}
                 }
 
+                // Cứu cánh: Nếu NguonC không có file m3u8 direct, gọi fallback để không bị "Không tìm thấy luồng"
+                if (!directM3u8) {
+                    const fallback = await fetchFallbackStream(slug, episodeTarget, movieTitle);
+                    if (fallback) {
+                        directM3u8 = fallback.url;
+                        sourceLabel = `${fallback.source} (Bù NguonC)`;
+                    }
+                }
+
                 if (directM3u8) {
-                    streams.push({ name: `[NguonC] Mượt`, title: `Tập ${targetEp.name || episodeTarget} - Proxy Server (Khuyên Dùng)`, url: `${renderHost}/proxy-m3u8?url=${encodeURIComponent(directM3u8)}` });
-                    streams.push({ name: `[NguonC] Local`, title: `Tập ${targetEp.name || episodeTarget} - Mạng Cáp Quang Nhà Bạn`, url: directM3u8, behaviorHints: { requestHeaders: { "Referer": "https://phim.nguonc.com/", "Origin": "https://phim.nguonc.com/" } } });
+                    streams.push({ 
+                        name: `[${sourceLabel}] Proxy`, 
+                        title: `Tập ${targetEp.name || episodeTarget} - Chống Giật Lag (Render)`, 
+                        url: `${renderHost}/proxy-m3u8?url=${encodeURIComponent(directM3u8)}` 
+                    });
+                    streams.push({ 
+                        name: `[${sourceLabel}] Direct`, 
+                        title: `Tập ${targetEp.name || episodeTarget} - Tốc độ gốc`, 
+                        url: directM3u8, 
+                        behaviorHints: { requestHeaders: { "Referer": "https://phim.nguonc.com/", "Origin": "https://phim.nguonc.com/" } } 
+                    });
+                }
+
+                if (embedUrl) {
+                    streams.push({ name: `[NguonC] Web`, title: `Tập ${targetEp.name || episodeTarget} - Mở qua trình duyệt`, externalUrl: embedUrl });
                 }
             }
         }
