@@ -7,14 +7,13 @@ const KKPHIM_API = 'https://phimapi.com';
 const OPHIM_API = 'https://ophim1.com';
 const PORT = process.env.PORT || 7000;
 
-let PUBLIC_BASE_URL = (process.env.RENDER_EXTERNAL_URL || '').replace(/\/$/, '');
-
 const FAKE_HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
     'Referer': 'https://phim.nguonc.com/',
     'Origin': 'https://phim.nguonc.com'
 };
 
+// Bộ nhớ đệm RAM tốc độ cao
 const cache = new Map();
 function getCache(key) {
     const item = cache.get(key);
@@ -26,15 +25,15 @@ function getCache(key) {
     return item.value;
 }
 function setCache(key, value, ttlSeconds = 1800) {
-    if (cache.size > 1000) cache.clear();
+    if (cache.size > 1500) cache.clear();
     cache.set(key, { value, expiry: Date.now() + ttlSeconds * 1000 });
 }
 
 const builder = new addonBuilder({
     id: 'org.nguonc.stremio.v86',
-    version: '9.2.0',
-    name: 'NguonC Siêu Nhẹ (Pro + Deep Extract)',
-    description: 'Bóc tách sâu AJAX/Player NguonC + HLS Proxy + KKPhim/OPhim',
+    version: '9.3.0',
+    name: 'NguonC Siêu Nhẹ (Turbo)',
+    description: 'Tốc độ siêu nhanh: Danh mục NguonC kết hợp luồng Direct HLS mượt mà cho Stremio',
     resources: ['catalog', 'meta', 'stream'],
     types: ['movie', 'series', 'anime'],
     idPrefixes: ['tt', 'nguonc_'],
@@ -87,8 +86,8 @@ async function fetchNguonC(endpoint) {
     const cached = getCache(cacheKey);
     if (cached) return cached;
     try {
-        const res = await axios.get(`${NGUONC_API}${endpoint}`, { headers: FAKE_HEADERS, timeout: 7000 });
-        if (res.data) setCache(cacheKey, res.data, 900);
+        const res = await axios.get(`${NGUONC_API}${endpoint}`, { headers: FAKE_HEADERS, timeout: 4000 });
+        if (res.data) setCache(cacheKey, res.data, 1800);
         return res.data;
     } catch (err) {
         return null;
@@ -101,7 +100,7 @@ async function getImdbMeta(type, imdbId) {
     if (cached) return cached;
     try {
         const reqType = type === 'anime' ? 'series' : type;
-        const res = await axios.get(`https://v3-cinemeta.strem.io/meta/${reqType}/${imdbId}.json`, { timeout: 5000 });
+        const res = await axios.get(`https://v3-cinemeta.strem.io/meta/${reqType}/${imdbId}.json`, { timeout: 3500 });
         const meta = res.data?.meta;
         if (!meta?.name) return null;
         const yearMatch = String(meta.releaseInfo || meta.year || '').match(/\d{4}/);
@@ -116,214 +115,39 @@ async function getImdbMeta(type, imdbId) {
     }
 }
 
-function unpackPacker(str) {
-    let unpacked = '';
-    try {
-        const regex = /eval\(function\(p,a,c,k,e,[rd]\)\{.*?\}\('(.*?)',\s*(\d+),\s*(\d+),\s*'(.*?)'\.split\('\|'\)/gs;
-        let match;
-        while ((match = regex.exec(str)) !== null) {
-            let [_, p, a, c, k] = match;
-            a = parseInt(a, 10);
-            c = parseInt(c, 10);
-            k = k.split('|');
-            const e = function (c) {
-                return (c < a ? '' : e(parseInt(c / a, 10))) + ((c = c % a) > 35 ? String.fromCharCode(c + 29) : c.toString(36));
-            };
-            while (c--) {
-                if (k[c]) {
-                    p = p.replace(new RegExp('\\b' + e(c) + '\\b', 'g'), k[c]);
-                }
-            }
-            unpacked += '\n' + p;
-        }
-    } catch (e) {}
-    return unpacked;
-}
-
-// Quét mọi định dạng luồng HLS (.m3u8, .txt playlist, JWPlayer file/sources, Base64)
-function extractStreamUrl(data, baseEmbedUrl = '') {
-    try {
-        if (!data) return null;
-        if (typeof data === 'object') {
-            const direct = data.m3u8 || data.link_m3u8 || data.m3u8_link || data.file || data.url || data.source;
-            if (typeof direct === 'string' && (direct.includes('.m3u8') || direct.includes('/hls/') || direct.includes('.txt'))) {
-                return baseEmbedUrl ? new URL(direct, baseEmbedUrl).href : direct;
-            }
-        }
-        let str = typeof data === 'string' ? data : JSON.stringify(data);
-        if (str.includes('eval(function(p,a,c,k,e,')) {
-            str += '\n' + unpackPacker(str);
-        }
-
-        // Giải mã các chuỗi atob("...") hoặc Base64 ẩn trong script
-        const atobRegex = /atob\(\s*["']([A-Za-z0-9+/=]+)["']\s*\)/g;
-        let atobMatch;
-        while ((atobMatch = atobRegex.exec(str)) !== null) {
-            try {
-                str += '\n' + Buffer.from(atobMatch[1], 'base64').toString('utf8');
-            } catch (e) {}
-        }
-
-        let decoded = str.replace(/\\u[\dA-F]{4}/gi, m => String.fromCharCode(parseInt(m.replace(/\\u/g, ''), 16)));
-        decoded = decoded.replace(/\\\//g, '/');
-
-        // 1. Tìm trực tiếp URL .m3u8
-        let match = decoded.match(/(?:https?:)?\/\/[^"'\s<>\[\]{}()]+\.m3u8[^"'\s<>\[\]{}()]*/i);
-        if (match) return match[0].startsWith('//') ? 'https:' + match[0] : match[0];
-
-        // 2. Tìm trong cấu hình Player: file: "...", src: "...", url: "..." (kể cả khi đổi đuôi sang .txt hoặc không đuôi)
-        const fileRegex = /(?:["']?(?:file|src|url|source|link)["']?\s*:\s*["'])((?:https?:\/\/|\/)[^"'\s]+\.(?:m3u8|txt|mp4)[^"'\s]*|(?:https?:\/\/|\/)[^"'\s]*(?:\/hls\/|\/playlist\/|\/master|\/index)[^"'\s]*)/i;
-        const fileMatch = decoded.match(fileRegex);
-        if (fileMatch && fileMatch[1] && !fileMatch[1].endsWith('.js') && !fileMatch[1].endsWith('.css')) {
-            return baseEmbedUrl ? new URL(fileMatch[1], baseEmbedUrl).href : fileMatch[1];
-        }
-
-        // 3. Quét các chuỗi Base64 bắt đầu bằng aHR0c (http)
-        let b64Matches = decoded.match(/(aHR0c[A-Za-z0-9+/=]{15,})/g);
-        if (b64Matches) {
-            for (let b64 of b64Matches) {
-                try {
-                    let dec = Buffer.from(b64, 'base64').toString('utf8');
-                    let m = dec.match(/(?:https?:)?\/\/[^"'\s<>\[\]{}()]+(?:\.m3u8|\/hls\/|\.txt)[^"'\s<>\[\]{}()]*/i);
-                    if (m) return m[0].startsWith('//') ? 'https:' + m[0] : m[0];
-                } catch (e) {}
-            }
-        }
-    } catch (e) {}
-    return null;
-}
-
-// Bóc tách sâu trang embed NguonC (Hỗ trợ cả iframe lồng nhau + gọi AJAX POST ngầm của streamc.xyz)
-async function scrapeNguonCEmbed(embedUrl) {
-    if (!embedUrl) return { m3u8: null, reason: 'NoURL' };
-    const cacheKey = `embed_v92:${embedUrl}`;
-    const cached = getCache(cacheKey);
-    if (cached !== null) return cached;
-
-    try {
-        const parsedUrl = new URL(embedUrl);
-        const embedOrigin = parsedUrl.origin;
-        const hash = parsedUrl.searchParams.get('hash') || parsedUrl.searchParams.get('id') || parsedUrl.pathname.split('/').pop();
-
-        const res = await axios.get(embedUrl, {
-            headers: {
-                'User-Agent': FAKE_HEADERS['User-Agent'],
-                'Referer': 'https://phim.nguonc.com/',
-                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-                'Accept-Language': 'vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7'
-            },
-            timeout: 4500,
-            validateStatus: () => true
-        });
-
-        if (res.status !== 200) {
-            return { m3u8: null, reason: `HTTP_${res.status}` };
-        }
-
-        const cookies = Array.isArray(res.headers['set-cookie'])
-            ? res.headers['set-cookie'].map(c => c.split(';')[0]).join('; ')
-            : '';
-
-        const html = typeof res.data === 'string' ? res.data : JSON.stringify(res.data);
-
-        if (html.includes('cf-browser-verification') || html.includes('Just a moment...')) {
-            return { m3u8: null, reason: 'Cloudflare_Block' };
-        }
-
-        // Bước 1: Quét trực tiếp trong HTML / Packer
-        let m3u8 = extractStreamUrl(html, embedUrl);
-        if (m3u8) {
-            const out = { m3u8, reason: 'OK_HTML' };
-            setCache(cacheKey, out, 1800);
-            return out;
-        }
-
-        // Bước 2: Tìm các đường dẫn AJAX được gọi trong script của trang embed
-        const ajaxHeaders = {
-            'User-Agent': FAKE_HEADERS['User-Agent'],
-            'Referer': embedUrl,
-            'Origin': embedOrigin,
-            'X-Requested-With': 'XMLHttpRequest',
-            'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8'
-        };
-        if (cookies) ajaxHeaders['Cookie'] = cookies;
-
-        const ajaxEndpoints = new Set();
-        const ajaxRegex = /(?:fetch|\$\.post|\$\.ajax|\$\.get|axios\.post|axios\.get|open)\s*\(\s*(?:["'](?:POST|GET)["']\s*,\s*)?["']([^"']+\.(?:php|json|txt)|\/ajax\/[^"']+|\/api\/[^"']+)["']/gi;
-        let m;
-        while ((m = ajaxRegex.exec(html)) !== null) {
-            if (m[1] && !m[1].includes('google') && !m[1].includes('analytics')) {
-                try {
-                    ajaxEndpoints.add(new URL(m[1], embedUrl).href);
-                } catch (e) {}
-            }
-        }
-
-        // Các endpoint AJAX phổ biến của hệ thống streamc.xyz / NguonC player
-        if (hash) {
-            ajaxEndpoints.add(`${embedOrigin}/ajax.php`);
-            ajaxEndpoints.add(`${embedOrigin}/get.php?hash=${encodeURIComponent(hash)}`);
-            ajaxEndpoints.add(`${embedOrigin}/player/index.php?data=${encodeURIComponent(hash)}&do=getVideo`);
-        }
-
-        for (const ep of ajaxEndpoints) {
-            try {
-                const bodyData = `hash=${encodeURIComponent(hash || '')}&id=${encodeURIComponent(hash || '')}&r=${encodeURIComponent('https://phim.nguonc.com/')}`;
-                const ajaxRes = await axios.post(ep, bodyData, { headers: ajaxHeaders, timeout: 2500, validateStatus: () => true });
-                if (ajaxRes.status === 200 && ajaxRes.data) {
-                    m3u8 = extractStreamUrl(ajaxRes.data, embedUrl);
-                    if (m3u8) {
-                        const out = { m3u8, reason: 'OK_AJAX' };
-                        setCache(cacheKey, out, 1800);
-                        return out;
-                    }
-                }
-            } catch (e) {}
-        }
-
-        // Bước 3: Kiểm tra nếu trang embed chứa 1 iframe con khác
-        const iframeMatch = html.match(/<iframe[^>]+src=["']([^"']+)["']/i);
-        if (iframeMatch && iframeMatch[1]) {
-            const subUrl = new URL(iframeMatch[1], embedUrl).href;
-            if (subUrl !== embedUrl) {
-                const subRes = await axios.get(subUrl, { headers: { ...ajaxHeaders, 'Referer': embedUrl }, timeout: 3000, validateStatus: () => true });
-                if (subRes.status === 200 && subRes.data) {
-                    m3u8 = extractStreamUrl(subRes.data, subUrl);
-                    if (m3u8) {
-                        const out = { m3u8, reason: 'OK_IFRAME' };
-                        setCache(cacheKey, out, 1800);
-                        return out;
-                    }
-                }
-            }
-        }
-
-        return { m3u8: null, reason: 'Encrypted_Player' };
-    } catch (e) {
-        return { m3u8: null, reason: e.code || 'Timeout_Or_Blocked' };
-    }
-}
-
-function pickBestSearchMatch(items, queryTitle, targetYear) {
+// Chấm điểm khớp tên phim (Hỗ trợ so khớp cả tên tiếng Việt và tên gốc tiếng Anh)
+function pickBestSearchMatch(items, queries, targetYear, seasonTarget = 1) {
     if (!Array.isArray(items) || items.length === 0) return null;
-    const normQuery = normalizeStr(queryTitle);
+    const normQueries = queries.map(q => normalizeStr(q)).filter(Boolean);
 
     let bestItem = items[0];
-    let bestScore = -1;
+    let bestScore = -999;
 
     for (const item of items) {
         let score = 0;
         const normName = normalizeStr(item.name);
         const normOrigin = normalizeStr(item.original_name || item.origin_name);
 
-        if (normOrigin === normQuery || normName === normQuery) score += 50;
-        else if (normOrigin.includes(normQuery) || normName.includes(normQuery)) score += 20;
+        for (const q of normQueries) {
+            if (normOrigin === q || normName === q) score += 60;
+            else if (normOrigin.includes(q) || normName.includes(q)) score += 25;
+        }
+
+        // Ưu tiên khớp đúng Phần/Season (nếu xem series nhiều mùa)
+        if (seasonTarget > 1) {
+            const seasonPatterns = [`phan ${seasonTarget}`, `season ${seasonTarget}`, ` p${seasonTarget}`, ` s${seasonTarget}`];
+            if (seasonPatterns.some(p => normName.includes(p) || normOrigin.includes(p))) {
+                score += 40;
+            }
+        } else if (seasonTarget === 1) {
+            if (/(phan|season)\s*[2-9]/.test(normName)) score -= 25;
+        }
 
         const itemYear = parseInt(item.year, 10);
         if (targetYear && itemYear) {
             if (itemYear === targetYear) score += 30;
             else if (Math.abs(itemYear - targetYear) <= 1) score += 10;
-            else score -= 15;
+            else if (seasonTarget === 1) score -= 15;
         }
 
         if (score > bestScore) {
@@ -334,45 +158,66 @@ function pickBestSearchMatch(items, queryTitle, targetYear) {
     return bestItem;
 }
 
-async function getExternalStreams(providerName, baseUrl, slug, searchKeyword, targetYear, episodeTarget, type) {
-    const results = [];
-    let targetSlug = slug;
+// Lấy thông tin phim từ KKPhim / OPhim có bộ nhớ đệm (Tránh gọi lại khi chuyển tập)
+async function fetchExternalMovieDetail(baseUrl, slug, searchKeywords, targetYear, seasonTarget) {
+    const cacheKey = `ext_movie:${baseUrl}:${slug || ''}:${searchKeywords.join('|')}:s${seasonTarget}`;
+    const cached = getCache(cacheKey);
+    if (cached) return cached;
 
     try {
-        let movieData = null;
-        if (targetSlug && !targetSlug.startsWith('tt')) {
+        // 1. Nếu đang xem Season 1 và có sẵn slug từ NguonC -> thử gọi thẳng theo slug cực nhanh
+        if (slug && !slug.startsWith('tt') && seasonTarget === 1) {
             try {
-                const res = await axios.get(`${baseUrl}/phim/${targetSlug}`, { timeout: 4500 });
-                if (res.data?.episodes?.length > 0) movieData = res.data;
+                const res = await axios.get(`${baseUrl}/phim/${slug}`, { timeout: 3000 });
+                if (res.data?.episodes?.length > 0) {
+                    setCache(cacheKey, res.data, 1800);
+                    return res.data;
+                }
             } catch (e) {}
         }
 
-        if (!movieData && searchKeyword) {
-            const searchRes = await axios.get(`${baseUrl}/v1/api/tim-kiem?keyword=${encodeURIComponent(searchKeyword)}&limit=5`, { timeout: 4500 });
-            const items = searchRes.data?.data?.items || [];
-            const matched = pickBestSearchMatch(items, searchKeyword, targetYear);
-            if (matched?.slug) {
-                const detailRes = await axios.get(`${baseUrl}/phim/${matched.slug}`, { timeout: 4500 });
-                if (detailRes.data?.episodes?.length > 0) movieData = detailRes.data;
-            }
-        }
-
-        const servers = movieData?.episodes || [];
-        for (const server of servers) {
-            const epItems = server.server_data || server.items || [];
-            const targetEp = findEpisodeItem(epItems, episodeTarget, type);
-            if (targetEp && targetEp.link_m3u8 && targetEp.link_m3u8.includes('.m3u8')) {
-                const srvName = server.server_name ? ` - ${server.server_name}` : '';
-                const cleanEpName = String(targetEp.name || episodeTarget).replace(/^(tập|tap)\s*/i, '');
-                results.push({
-                    name: `[${providerName}] Direct`,
-                    title: `Tập ${cleanEpName}${srvName} (Tốc độ cao)`,
-                    url: targetEp.link_m3u8
-                });
-            }
+        // 2. Tìm kiếm theo danh sách từ khóa (Tên Việt / Tên gốc tiếng Anh)
+        for (const kw of searchKeywords) {
+            if (!kw) continue;
+            try {
+                const searchRes = await axios.get(`${baseUrl}/v1/api/tim-kiem?keyword=${encodeURIComponent(kw)}&limit=6`, { timeout: 3000 });
+                const items = searchRes.data?.data?.items || [];
+                if (items.length > 0) {
+                    const matched = pickBestSearchMatch(items, searchKeywords, targetYear, seasonTarget);
+                    if (matched?.slug) {
+                        const detailRes = await axios.get(`${baseUrl}/phim/${matched.slug}`, { timeout: 3000 });
+                        if (detailRes.data?.episodes?.length > 0) {
+                            setCache(cacheKey, detailRes.data, 1800);
+                            return detailRes.data;
+                        }
+                    }
+                }
+            } catch (e) {}
         }
     } catch (e) {}
 
+    return null;
+}
+
+async function getExternalStreams(providerName, baseUrl, slug, searchKeywords, targetYear, seasonTarget, episodeTarget, type) {
+    const results = [];
+    const movieData = await fetchExternalMovieDetail(baseUrl, slug, searchKeywords, targetYear, seasonTarget);
+    if (!movieData) return results;
+
+    const servers = movieData.episodes || [];
+    for (const server of servers) {
+        const epItems = server.server_data || server.items || [];
+        const targetEp = findEpisodeItem(epItems, episodeTarget, type);
+        if (targetEp && targetEp.link_m3u8 && targetEp.link_m3u8.includes('.m3u8')) {
+            const srvName = server.server_name ? ` - ${server.server_name}` : '';
+            const cleanEpName = String(targetEp.name || episodeTarget).replace(/^(tập|tap)\s*/i, '');
+            results.push({
+                name: `⚡ [NguonC-${providerName}] Direct`,
+                title: `Tập ${cleanEpName}${srvName} (Phát ngay trong Stremio)`,
+                url: targetEp.link_m3u8
+            });
+        }
+    }
     return results;
 }
 
@@ -455,16 +300,17 @@ builder.defineMetaHandler(async ({ type, id }) => {
     }
 });
 
-// 3. STREAM HANDLER
+// 3. STREAM HANDLER (SIÊU TỐC - KHÔNG CHỜ SCRAPE EMBED)
 builder.defineStreamHandler(async ({ type, id }) => {
     try {
-        const streamCacheKey = `stream_v92:${type}:${id}`;
+        const streamCacheKey = `stream_v93:${type}:${id}`;
         const cachedStreams = getCache(streamCacheKey);
         if (cachedStreams) return { streams: cachedStreams };
 
         let slug = null;
+        let seasonTarget = 1;
         let episodeTarget = 1;
-        let searchKeyword = null;
+        let imdbName = null;
         let targetYear = null;
 
         if (id.startsWith('nguonc_')) {
@@ -474,104 +320,77 @@ builder.defineStreamHandler(async ({ type, id }) => {
         } else if (id.startsWith('tt')) {
             const parts = id.split(':');
             const imdbId = parts[0];
-            if (parts.length > 2) episodeTarget = parseInt(parts[2], 10) || 1;
+            if (parts.length > 2) {
+                seasonTarget = parseInt(parts[1], 10) || 1;
+                episodeTarget = parseInt(parts[2], 10) || 1;
+            }
 
             const imdbMeta = await getImdbMeta(type, imdbId);
             if (!imdbMeta) return { streams: [] };
-            searchKeyword = imdbMeta.name;
+            imdbName = imdbMeta.name;
             targetYear = imdbMeta.year;
-
-            const searchData = await fetchNguonC(`/films/search?keyword=${encodeURIComponent(searchKeyword)}`);
-            const items = searchData?.items || searchData?.data?.items || searchData?.data || [];
-            const bestMatch = pickBestSearchMatch(items, searchKeyword, targetYear);
-            if (bestMatch) slug = bestMatch.slug;
         }
 
-        const detailData = slug ? await fetchNguonC(`/film/${slug}`) : null;
+        // Nếu vào từ IMDb (tt...), tìm trên NguonC đồng thời tìm luôn trên KKPhim/OPhim (Chạy song song 100%)
+        let nguonCPromise;
+        if (slug) {
+            nguonCPromise = fetchNguonC(`/film/${slug}`);
+        } else if (imdbName) {
+            nguonCPromise = (async () => {
+                const searchData = await fetchNguonC(`/films/search?keyword=${encodeURIComponent(imdbName)}`);
+                const items = searchData?.items || searchData?.data?.items || searchData?.data || [];
+                const best = pickBestSearchMatch(items, [imdbName], targetYear, seasonTarget);
+                if (best?.slug) {
+                    slug = best.slug;
+                    return await fetchNguonC(`/film/${best.slug}`);
+                }
+                return null;
+            })();
+        } else {
+            nguonCPromise = Promise.resolve(null);
+        }
+
+        const detailData = await nguonCPromise;
         const movie = detailData?.movie || detailData?.film;
 
-        if (!searchKeyword && movie) {
-            searchKeyword = movie.name || movie.original_name;
-        }
+        // Tập hợp từ khóa tìm kiếm (cả tên Việt và tên gốc tiếng Anh) để không bao giờ trượt phim
+        const searchKeywords = [];
+        if (imdbName) searchKeywords.push(imdbName);
+        if (movie?.name && !searchKeywords.includes(movie.name)) searchKeywords.push(movie.name);
+        if (movie?.original_name && !searchKeywords.includes(movie.original_name)) searchKeywords.push(movie.original_name);
 
-        const servers = movie?.episodes || detailData?.episodes || [];
-
-        const nguonCTasks = servers.map(async (server) => {
-            const epItems = server.items || server.server_data || [];
-            const targetEp = findEpisodeItem(epItems, episodeTarget, type);
-            if (!targetEp) return null;
-
-            const srvName = server.server_name ? ` - ${server.server_name}` : '';
-            const embedUrl = targetEp.embed || targetEp.link_embed || '';
-            let directM3u8 = extractStreamUrl(targetEp, embedUrl);
-            let failReason = '';
-
-            if (!directM3u8 && embedUrl) {
-                const scraped = await scrapeNguonCEmbed(embedUrl);
-                directM3u8 = scraped.m3u8;
-                failReason = scraped.reason;
-            }
-
-            const cleanEpName = String(targetEp.name || episodeTarget).replace(/^(tập|tap)\s*/i, '');
-            return {
-                epName: cleanEpName,
-                srvName,
-                embedUrl,
-                directM3u8,
-                failReason
-            };
-        });
-
-        const [nguonCResults, kkStreams, ophimStreams] = await Promise.all([
-            Promise.all(nguonCTasks),
-            getExternalStreams('KKPhim', KKPHIM_API, slug, searchKeyword, targetYear, episodeTarget, type),
-            getExternalStreams('OPhim', OPHIM_API, slug, searchKeyword, targetYear, episodeTarget, type)
+        // Chạy song song KKPhim và OPhim
+        const [kkStreams, ophimStreams] = await Promise.all([
+            getExternalStreams('KK', KKPHIM_API, slug, searchKeywords, targetYear, seasonTarget, episodeTarget, type),
+            getExternalStreams('OP', OPHIM_API, slug, searchKeywords, targetYear, seasonTarget, episodeTarget, type)
         ]);
 
         const directStreams = [];
         const webStreams = [];
 
-        for (const item of nguonCResults) {
-            if (!item) continue;
-            const { epName, srvName, embedUrl, directM3u8, failReason } = item;
+        const servers = movie?.episodes || detailData?.episodes || [];
+        for (const server of servers) {
+            const epItems = server.items || server.server_data || [];
+            const targetEp = findEpisodeItem(epItems, episodeTarget, type);
+            if (!targetEp) continue;
 
-            if (directM3u8) {
-                let embedOrigin = 'https://embed.streamc.xyz';
-                try {
-                    if (embedUrl) embedOrigin = new URL(embedUrl).origin;
-                } catch (e) {}
+            const srvName = server.server_name ? ` - ${server.server_name}` : '';
+            const cleanEpName = String(targetEp.name || episodeTarget).replace(/^(tập|tap)\s*/i, '');
+            const directM3u8 = targetEp.m3u8 || targetEp.link_m3u8;
+            const embedUrl = targetEp.embed || targetEp.link_embed || '';
 
-                if (PUBLIC_BASE_URL) {
-                    const proxyUrl = `${PUBLIC_BASE_URL}/proxy?url=${encodeURIComponent(directM3u8)}&ref=${encodeURIComponent(embedOrigin + '/')}`;
-                    directStreams.push({
-                        name: `[NguonC] Direct (Proxy)`,
-                        title: `Tập ${epName}${srvName} (Phát trực tiếp)`,
-                        url: proxyUrl
-                    });
-                }
-
+            if (directM3u8 && directM3u8.includes('.m3u8')) {
                 directStreams.push({
-                    name: `[NguonC] Direct`,
-                    title: `Tập ${epName}${srvName} (Luồng gốc)`,
-                    url: directM3u8,
-                    behaviorHints: {
-                        notWebReady: true,
-                        proxyHeaders: {
-                            request: {
-                                'User-Agent': FAKE_HEADERS['User-Agent'],
-                                'Referer': `${embedOrigin}/`,
-                                'Origin': embedOrigin
-                            }
-                        }
-                    }
+                    name: `⚡ [NguonC] Direct`,
+                    title: `Tập ${cleanEpName}${srvName} (Phát ngay)`,
+                    url: directM3u8
                 });
             }
 
             if (embedUrl) {
-                const statusNote = directM3u8 ? 'Mở trình duyệt' : `Web - ${failReason || 'Không có m3u8'}`;
                 webStreams.push({
-                    name: `[NguonC] Web`,
-                    title: `Tập ${epName}${srvName} (${statusNote})`,
+                    name: `🌐 [NguonC] Web`,
+                    title: `Tập ${cleanEpName}${srvName} (Mở trình duyệt)`,
                     externalUrl: embedUrl
                 });
             }
@@ -595,7 +414,7 @@ builder.defineStreamHandler(async ({ type, id }) => {
         }
 
         if (uniqueStreams.length > 0) {
-            setCache(streamCacheKey, uniqueStreams, 900);
+            setCache(streamCacheKey, uniqueStreams, 1800);
         }
 
         return { streams: uniqueStreams };
@@ -606,80 +425,9 @@ builder.defineStreamHandler(async ({ type, id }) => {
 
 const app = express();
 app.use((req, res, next) => {
-    if (!PUBLIC_BASE_URL && req.headers.host) {
-        const proto = req.headers['x-forwarded-proto'] || req.protocol || 'https';
-        PUBLIC_BASE_URL = `${proto}://${req.headers.host}`;
-    }
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Access-Control-Allow-Headers', '*');
     next();
-});
-
-app.get('/proxy', async (req, res) => {
-    const targetUrl = req.query.url;
-    const referer = req.query.ref || 'https://embed.streamc.xyz/';
-    if (!targetUrl) return res.status(400).send('Missing url');
-
-    try {
-        let origin = 'https://embed.streamc.xyz';
-        try { origin = new URL(referer).origin; } catch (e) {}
-
-        const response = await axios.get(targetUrl, {
-            headers: {
-                'User-Agent': FAKE_HEADERS['User-Agent'],
-                'Referer': referer,
-                'Origin': origin
-            },
-            responseType: 'text',
-            timeout: 8000
-        });
-
-        const content = response.data;
-        if (typeof content === 'string' && content.includes('#EXTM3U')) {
-            res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
-            const lines = content.split('\n');
-            const rewritten = lines.map(line => {
-                const trimmed = line.trim();
-                if (!trimmed || trimmed.startsWith('#')) return line;
-                try {
-                    const absUrl = new URL(trimmed, targetUrl).href;
-                    if (absUrl.includes('.m3u8') || absUrl.includes('.txt')) {
-                        return `${PUBLIC_BASE_URL}/proxy?url=${encodeURIComponent(absUrl)}&ref=${encodeURIComponent(referer)}`;
-                    }
-                    return absUrl;
-                } catch (e) {
-                    return line;
-                }
-            }).join('\n');
-            return res.send(rewritten);
-        }
-
-        res.send(content);
-    } catch (e) {
-        res.status(502).send('Proxy error');
-    }
-});
-
-// CỔNG SOI MÃ NGUỒN EMBED NGUONC: /debug-embed?url=https://embed.streamc.xyz/embed.php?hash=...
-app.get('/debug-embed', async (req, res) => {
-    const url = req.query.url;
-    if (!url) return res.status(400).json({ error: 'Hãy truyền ?url=link_embed_nguonc' });
-    try {
-        const rawRes = await axios.get(url, {
-            headers: { 'User-Agent': FAKE_HEADERS['User-Agent'], 'Referer': 'https://phim.nguonc.com/' },
-            timeout: 5000,
-            validateStatus: () => true
-        });
-        const html = typeof rawRes.data === 'string' ? rawRes.data : JSON.stringify(rawRes.data);
-        const scraped = await scrapeNguonCEmbed(url);
-        res.json({
-            status: rawRes.status,
-            scrapedResult: scraped,
-            htmlPreview: html.substring(0, 1500)
-        });
-    } catch (e) {
-        res.json({ error: e.message });
-    }
 });
 
 app.get('/health', (req, res) => res.status(200).send('OK'));
@@ -687,4 +435,4 @@ app.get('/health', (req, res) => res.status(200).send('OK'));
 const addonRouter = getRouter(builder.getInterface());
 app.use('/', addonRouter);
 
-app.listen(PORT, () => console.log(`Addon NguonC Pro running on port ${PORT}`));
+app.listen(PORT, () => console.log(`Addon NguonC Turbo running on port ${PORT}`));
