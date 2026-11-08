@@ -1,19 +1,23 @@
 const { addonBuilder, getRouter } = require('stremio-addon-sdk');
 const express = require('express');
 const axios = require('axios');
+const https = require('https');
 
 const NGUONC_API = 'https://phim.nguonc.com/api';
 const KKPHIM_API = 'https://phimapi.com';
 const OPHIM_API = 'https://ophim1.com';
 const PORT = process.env.PORT || 7000;
 
-const FAKE_HEADERS = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-    'Referer': 'https://phim.nguonc.com/',
-    'Origin': 'https://phim.nguonc.com'
+// Giữ kết nối TCP giúp tăng tốc độ gọi API và giảm lỗi timeout trên Render
+const httpsAgent = new https.Agent({ keepAlive: true, rejectUnauthorized: false });
+
+const CLIENT_HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+    'Accept': 'application/json, text/plain, */*',
+    'Accept-Language': 'vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7'
 };
 
-// Bộ nhớ đệm RAM tốc độ cao
+// Bộ nhớ đệm RAM
 const cache = new Map();
 function getCache(key) {
     const item = cache.get(key);
@@ -31,9 +35,9 @@ function setCache(key, value, ttlSeconds = 1800) {
 
 const builder = new addonBuilder({
     id: 'org.nguonc.stremio.v86',
-    version: '9.3.0',
-    name: 'NguonC Siêu Nhẹ (Turbo)',
-    description: 'Tốc độ siêu nhanh: Danh mục NguonC kết hợp luồng Direct HLS mượt mà cho Stremio',
+    version: '9.4.0',
+    name: 'NguonC Siêu Nhẹ (Auto-Fallback)',
+    description: 'Chống sập: Tự động chuyển đổi dự phòng NguonC + KKPhim + OPhim khi nghẽn mạng',
     resources: ['catalog', 'meta', 'stream'],
     types: ['movie', 'series', 'anime'],
     idPrefixes: ['tt', 'nguonc_'],
@@ -81,16 +85,63 @@ function findEpisodeItem(epItems, episodeTarget, type) {
     return null;
 }
 
+// Gọi API NguonC an toàn (Bỏ Origin giả để tránh bị Cloudflare chặn trên Render)
 async function fetchNguonC(endpoint) {
     const cacheKey = `nguonc:${endpoint}`;
     const cached = getCache(cacheKey);
     if (cached) return cached;
     try {
-        const res = await axios.get(`${NGUONC_API}${endpoint}`, { headers: FAKE_HEADERS, timeout: 4000 });
-        if (res.data) setCache(cacheKey, res.data, 1800);
-        return res.data;
-    } catch (err) {
+        const res = await axios.get(`${NGUONC_API}${endpoint}`, {
+            headers: CLIENT_HEADERS,
+            httpsAgent,
+            timeout: 6500
+        });
+        if (res.data && (res.data.status === 'success' || res.data.items || res.data.movie || res.data.film)) {
+            setCache(cacheKey, res.data, 1800);
+            return res.data;
+        }
         return null;
+    } catch (err) {
+        console.error(`[NguonC Error] ${endpoint}:`, err.message);
+        return null;
+    }
+}
+
+// Dự phòng: Lấy danh mục phim từ KKPhim nếu NguonC bị chặn hoặc quá tải trên Render
+async function fetchKKPhimCatalog(id, page, search) {
+    try {
+        let url = `${KKPHIM_API}/danh-sach/phim-moi-cap-nhat?page=${page}`;
+        if (search) {
+            url = `${KKPHIM_API}/v1/api/tim-kiem?keyword=${encodeURIComponent(search)}&limit=20`;
+        } else if (id === 'nguonc_movies') {
+            url = `${KKPHIM_API}/v1/api/danh-sach/phim-le?page=${page}`;
+        } else if (id === 'nguonc_series') {
+            url = `${KKPHIM_API}/v1/api/danh-sach/phim-bo?page=${page}`;
+        } else if (id === 'nguonc_hoathinh') {
+            url = `${KKPHIM_API}/v1/api/danh-sach/hoat-hinh?page=${page}`;
+        }
+
+        const res = await axios.get(url, { headers: CLIENT_HEADERS, httpsAgent, timeout: 6000 });
+        const items = res.data?.data?.items || res.data?.items || [];
+        const imgDomain = res.data?.data?.APP_DOMAIN_CDN_IMAGE || 'https://phimimg.com';
+
+        return items.map(item => {
+            let poster = item.poster_url || item.thumb_url || '';
+            if (poster && !poster.startsWith('http')) {
+                poster = `${imgDomain}/${poster.replace(/^\//, '')}`;
+            }
+            return {
+                slug: item.slug,
+                name: item.name,
+                original_name: item.origin_name || item.original_name || '',
+                poster_url: poster,
+                quality: item.quality || 'HD',
+                language: item.lang || 'Vietsub'
+            };
+        });
+    } catch (e) {
+        console.error('[KKPhim Catalog Fallback Error]:', e.message);
+        return [];
     }
 }
 
@@ -100,7 +151,7 @@ async function getImdbMeta(type, imdbId) {
     if (cached) return cached;
     try {
         const reqType = type === 'anime' ? 'series' : type;
-        const res = await axios.get(`https://v3-cinemeta.strem.io/meta/${reqType}/${imdbId}.json`, { timeout: 3500 });
+        const res = await axios.get(`https://v3-cinemeta.strem.io/meta/${reqType}/${imdbId}.json`, { httpsAgent, timeout: 4500 });
         const meta = res.data?.meta;
         if (!meta?.name) return null;
         const yearMatch = String(meta.releaseInfo || meta.year || '').match(/\d{4}/);
@@ -115,7 +166,6 @@ async function getImdbMeta(type, imdbId) {
     }
 }
 
-// Chấm điểm khớp tên phim (Hỗ trợ so khớp cả tên tiếng Việt và tên gốc tiếng Anh)
 function pickBestSearchMatch(items, queries, targetYear, seasonTarget = 1) {
     if (!Array.isArray(items) || items.length === 0) return null;
     const normQueries = queries.map(q => normalizeStr(q)).filter(Boolean);
@@ -133,7 +183,6 @@ function pickBestSearchMatch(items, queries, targetYear, seasonTarget = 1) {
             else if (normOrigin.includes(q) || normName.includes(q)) score += 25;
         }
 
-        // Ưu tiên khớp đúng Phần/Season (nếu xem series nhiều mùa)
         if (seasonTarget > 1) {
             const seasonPatterns = [`phan ${seasonTarget}`, `season ${seasonTarget}`, ` p${seasonTarget}`, ` s${seasonTarget}`];
             if (seasonPatterns.some(p => normName.includes(p) || normOrigin.includes(p))) {
@@ -158,17 +207,15 @@ function pickBestSearchMatch(items, queries, targetYear, seasonTarget = 1) {
     return bestItem;
 }
 
-// Lấy thông tin phim từ KKPhim / OPhim có bộ nhớ đệm (Tránh gọi lại khi chuyển tập)
 async function fetchExternalMovieDetail(baseUrl, slug, searchKeywords, targetYear, seasonTarget) {
     const cacheKey = `ext_movie:${baseUrl}:${slug || ''}:${searchKeywords.join('|')}:s${seasonTarget}`;
     const cached = getCache(cacheKey);
     if (cached) return cached;
 
     try {
-        // 1. Nếu đang xem Season 1 và có sẵn slug từ NguonC -> thử gọi thẳng theo slug cực nhanh
         if (slug && !slug.startsWith('tt') && seasonTarget === 1) {
             try {
-                const res = await axios.get(`${baseUrl}/phim/${slug}`, { timeout: 3000 });
+                const res = await axios.get(`${baseUrl}/phim/${slug}`, { headers: CLIENT_HEADERS, httpsAgent, timeout: 4500 });
                 if (res.data?.episodes?.length > 0) {
                     setCache(cacheKey, res.data, 1800);
                     return res.data;
@@ -176,16 +223,15 @@ async function fetchExternalMovieDetail(baseUrl, slug, searchKeywords, targetYea
             } catch (e) {}
         }
 
-        // 2. Tìm kiếm theo danh sách từ khóa (Tên Việt / Tên gốc tiếng Anh)
         for (const kw of searchKeywords) {
             if (!kw) continue;
             try {
-                const searchRes = await axios.get(`${baseUrl}/v1/api/tim-kiem?keyword=${encodeURIComponent(kw)}&limit=6`, { timeout: 3000 });
+                const searchRes = await axios.get(`${baseUrl}/v1/api/tim-kiem?keyword=${encodeURIComponent(kw)}&limit=6`, { headers: CLIENT_HEADERS, httpsAgent, timeout: 4500 });
                 const items = searchRes.data?.data?.items || [];
                 if (items.length > 0) {
                     const matched = pickBestSearchMatch(items, searchKeywords, targetYear, seasonTarget);
                     if (matched?.slug) {
-                        const detailRes = await axios.get(`${baseUrl}/phim/${matched.slug}`, { timeout: 3000 });
+                        const detailRes = await axios.get(`${baseUrl}/phim/${matched.slug}`, { headers: CLIENT_HEADERS, httpsAgent, timeout: 4500 });
                         if (detailRes.data?.episodes?.length > 0) {
                             setCache(cacheKey, detailRes.data, 1800);
                             return detailRes.data;
@@ -221,7 +267,7 @@ async function getExternalStreams(providerName, baseUrl, slug, searchKeywords, t
     return results;
 }
 
-// 1. CATALOG HANDLER
+// 1. CATALOG HANDLER (Có tự động Fallback sang KKPhim nếu NguonC lỗi)
 builder.defineCatalogHandler(async ({ type, id, extra }) => {
     try {
         const skip = (extra && extra.skip) ? parseInt(extra.skip, 10) : 0;
@@ -237,7 +283,12 @@ builder.defineCatalogHandler(async ({ type, id, extra }) => {
         }
 
         const data = await fetchNguonC(endpoint);
-        const items = data?.items || data?.data?.items || data?.data || [];
+        let items = data?.items || data?.data?.items || data?.data || [];
+
+        // Nếu NguonC chặn IP Render hoặc trả về rỗng -> Tự động lấy danh sách từ KKPhim
+        if (!Array.isArray(items) || items.length === 0) {
+            items = await fetchKKPhimCatalog(id, page, extra?.search);
+        }
 
         return {
             metas: items.map(item => ({
@@ -253,18 +304,36 @@ builder.defineCatalogHandler(async ({ type, id, extra }) => {
     }
 });
 
-// 2. META HANDLER
+// 2. META HANDLER (Hỗ trợ cả NguonC lẫn KKPhim/OPhim khi NguonC lỗi)
 builder.defineMetaHandler(async ({ type, id }) => {
     try {
         if (!id.startsWith('nguonc_')) return { meta: null };
         const slug = id.replace('nguonc_', '').split(':')[0];
-        const detailData = await fetchNguonC(`/film/${slug}`);
-        const movie = detailData?.movie || detailData?.film;
+
+        let detailData = await fetchNguonC(`/film/${slug}`);
+        let movie = detailData?.movie || detailData?.film;
+        let servers = movie?.episodes || detailData?.episodes || [];
+
+        // Dự phòng: Nếu NguonC không tải được chi tiết phim, lấy từ KKPhim hoặc OPhim
+        if (!movie) {
+            const extData = await fetchExternalMovieDetail(KKPHIM_API, slug, [], null, 1)
+                         || await fetchExternalMovieDetail(OPHIM_API, slug, [], null, 1);
+            if (extData?.movie) {
+                movie = {
+                    name: extData.movie.name,
+                    poster_url: extData.movie.poster_url || extData.movie.thumb_url,
+                    thumb_url: extData.movie.thumb_url || extData.movie.poster_url,
+                    description: extData.movie.content || '',
+                    quality: extData.movie.quality || 'HD',
+                    language: extData.movie.lang || 'Vietsub'
+                };
+                servers = extData.episodes || [];
+            }
+        }
+
         if (!movie) return { meta: null };
 
-        const servers = movie.episodes || detailData?.episodes || [];
         const episodesList = [];
-
         if (type !== 'movie' && servers.length > 0) {
             let maxEpItems = [];
             for (const srv of servers) {
@@ -300,10 +369,10 @@ builder.defineMetaHandler(async ({ type, id }) => {
     }
 });
 
-// 3. STREAM HANDLER (SIÊU TỐC - KHÔNG CHỜ SCRAPE EMBED)
+// 3. STREAM HANDLER
 builder.defineStreamHandler(async ({ type, id }) => {
     try {
-        const streamCacheKey = `stream_v93:${type}:${id}`;
+        const streamCacheKey = `stream_v94:${type}:${id}`;
         const cachedStreams = getCache(streamCacheKey);
         if (cachedStreams) return { streams: cachedStreams };
 
@@ -331,7 +400,6 @@ builder.defineStreamHandler(async ({ type, id }) => {
             targetYear = imdbMeta.year;
         }
 
-        // Nếu vào từ IMDb (tt...), tìm trên NguonC đồng thời tìm luôn trên KKPhim/OPhim (Chạy song song 100%)
         let nguonCPromise;
         if (slug) {
             nguonCPromise = fetchNguonC(`/film/${slug}`);
@@ -353,13 +421,11 @@ builder.defineStreamHandler(async ({ type, id }) => {
         const detailData = await nguonCPromise;
         const movie = detailData?.movie || detailData?.film;
 
-        // Tập hợp từ khóa tìm kiếm (cả tên Việt và tên gốc tiếng Anh) để không bao giờ trượt phim
         const searchKeywords = [];
         if (imdbName) searchKeywords.push(imdbName);
         if (movie?.name && !searchKeywords.includes(movie.name)) searchKeywords.push(movie.name);
         if (movie?.original_name && !searchKeywords.includes(movie.original_name)) searchKeywords.push(movie.original_name);
 
-        // Chạy song song KKPhim và OPhim
         const [kkStreams, ophimStreams] = await Promise.all([
             getExternalStreams('KK', KKPHIM_API, slug, searchKeywords, targetYear, seasonTarget, episodeTarget, type),
             getExternalStreams('OP', OPHIM_API, slug, searchKeywords, targetYear, seasonTarget, episodeTarget, type)
@@ -432,7 +498,28 @@ app.use((req, res, next) => {
 
 app.get('/health', (req, res) => res.status(200).send('OK'));
 
+// TRANG KIỂM TRA LỖI KẾT NỐI TỪ RENDER TỚI CÁC NGUỒN PHIM
+app.get('/status', async (req, res) => {
+    const checkSource = async (name, url) => {
+        const start = Date.now();
+        try {
+            const r = await axios.get(url, { headers: CLIENT_HEADERS, httpsAgent, timeout: 5000 });
+            return { name, status: r.status, timeMs: Date.now() - start, ok: true };
+        } catch (err) {
+            return { name, status: err.response?.status || 'ERR', error: err.message, timeMs: Date.now() - start, ok: false };
+        }
+    };
+
+    const [nguonc, kkphim, ophim] = await Promise.all([
+        checkSource('NguonC', `${NGUONC_API}/films/phim-moi-cap-nhat?page=1`),
+        checkSource('KKPhim', `${KKPHIM_API}/danh-sach/phim-moi-cap-nhat?page=1`),
+        checkSource('OPhim', `${OPHIM_API}/v1/api/danh-sach/phim-moi-cap-nhat?page=1`)
+    ]);
+
+    res.json({ version: '9.4.0', sources: { nguonc, kkphim, ophim } });
+});
+
 const addonRouter = getRouter(builder.getInterface());
 app.use('/', addonRouter);
 
-app.listen(PORT, () => console.log(`Addon NguonC Turbo running on port ${PORT}`));
+app.listen(PORT, () => console.log(`Addon NguonC v9.4.0 running on port ${PORT}`));
