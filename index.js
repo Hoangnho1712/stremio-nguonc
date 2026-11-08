@@ -8,11 +8,11 @@ const KKPHIM_API = 'https://phimapi.com';
 const OPHIM_API = 'https://ophim1.com';
 const PORT = process.env.PORT || 7000;
 
-let PUBLIC_BASE_URL = (process.env.RENDER_EXTERNAL_URL || '').replace(/\/$/, '');
+let PUBLIC_BASE_URL = (process.env.RENDER_EXTERNAL_URL || 'https://stremio-nguonc-hzjc.onrender.com').replace(/\/$/, '');
 
+// TẮT keepAlive ĐỂ TRÁNH TREO SOCKET VÀ DEADLOCK KHI RENDER NGỦ ĐÔNG
 const httpsAgent = new https.Agent({
-    keepAlive: true,
-    maxSockets: 100,
+    keepAlive: false,
     rejectUnauthorized: false
 });
 
@@ -22,7 +22,7 @@ const CLIENT_HEADERS = {
     'Accept-Language': 'vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7'
 };
 
-// Bộ nhớ đệm RAM
+// Bộ nhớ đệm RAM tự động giải phóng
 const cache = new Map();
 function getCache(key) {
     const item = cache.get(key);
@@ -34,11 +34,10 @@ function getCache(key) {
     return item.value;
 }
 function setCache(key, value, ttlSeconds = 1800) {
-    if (cache.size > 2000) cache.clear();
+    if (cache.size > 1500) cache.clear();
     cache.set(key, { value, expiry: Date.now() + ttlSeconds * 1000 });
 }
 
-// Lưu lại M3U8 gần nhất để bạn có thể soi qua /inspect-last
 let lastPlayedM3U8Info = null;
 
 function encodeUrlBase64(url) {
@@ -61,9 +60,9 @@ function decodeUrlBase64(b64) {
 
 const builder = new addonBuilder({
     id: 'org.nguonc.stremio.v86',
-    version: '9.8.0',
-    name: 'NguonC Siêu Nhẹ (Deep Segment AdBlock)',
-    description: 'Quét từng phân đoạn .ts (Kể cả khi ẩn thẻ Discontinuity ở phút 15) + Ưu tiên OPhim sạch',
+    version: '9.8.1',
+    name: 'NguonC Siêu Nhẹ (Anti-Freeze & Segment AdBlock)',
+    description: 'Bản vá chống treo kết nối Render + Quét phân đoạn quảng cáo',
     resources: ['catalog', 'meta', 'stream'],
     types: ['movie', 'series', 'anime'],
     idPrefixes: ['tt', 'nguonc_'],
@@ -140,7 +139,6 @@ function pickBestVariantUrl(masterContent, masterUrl) {
     return bestUrl;
 }
 
-// Phân tích đặc điểm nhận dạng của 1 URL phân đoạn (.ts / .png / .jpg)
 function analyzeSegmentUrl(absUrl) {
     try {
         const u = new URL(absUrl);
@@ -148,12 +146,10 @@ function analyzeSegmentUrl(absUrl) {
         const filename = parts.pop() || '';
         const dir = u.origin + parts.join('/');
 
-        // Tách phần chữ khung (pattern) và con số cuối cùng trong tên file
         const numMatches = [...filename.matchAll(/\d+/g)];
         const lastNumMatch = numMatches.length > 0 ? numMatches[numMatches.length - 1] : null;
         const seqNum = lastNumMatch ? parseInt(lastNumMatch[0], 10) : null;
 
-        // Khung chữ ký: thư mục + cấu trúc tên file (thay số bằng #) + độ dài tên file (nếu là mã hash)
         const pattern = filename.replace(/\d+/g, '#');
         const isHexHash = /^[a-f0-9]{16,}\.[a-z0-9]+$/i.test(filename);
         const sig = isHexHash ? `${dir}|HEX_LEN_${filename.length}` : `${dir}|${pattern}`;
@@ -164,7 +160,6 @@ function analyzeSegmentUrl(absUrl) {
     }
 }
 
-// THUẬT TOÁN QUÉT TỪNG PHÂN ĐOẠN (SEGMENT-LEVEL SCANNER) - BẤT CHẤP CÓ HAY KHÔNG CÓ DISCONTINUITY
 function stripAdsSegmentLevel(m3u8Content, baseUrl) {
     const lines = m3u8Content.split(/\r?\n/);
     const headerLines = [];
@@ -221,7 +216,6 @@ function stripAdsSegmentLevel(m3u8Content, baseUrl) {
             continue;
         }
 
-        // Đây là dòng URL của phân đoạn (.ts)
         seenFirstSegment = true;
         let absUrl = line;
         try { absUrl = new URL(line, baseUrl).href; } catch (e) {}
@@ -249,7 +243,6 @@ function stripAdsSegmentLevel(m3u8Content, baseUrl) {
 
     if (segments.length === 0) return { cleanedM3u8: m3u8Content, stats: { total: 0, removed: 0 } };
 
-    // 1. Tìm Chữ ký (Signature) và Thư mục (Dir) chủ đạo của bộ phim chính
     const sigDurations = {};
     const dirDurations = {};
     for (const seg of segments) {
@@ -269,22 +262,18 @@ function stripAdsSegmentLevel(m3u8Content, baseUrl) {
         if (d > maxDirDur) { maxDirDur = d; dominantDir = dir; }
     }
 
-    // 2. Đánh dấu từng phân đoạn nghi vấn là quảng cáo:
     for (const seg of segments) {
         const lowerUrl = seg.absUrl.toLowerCase();
-        // Lọc từ khóa đen
         if (lowerUrl.includes('9922') || lowerUrl.includes('/adjump/') || lowerUrl.includes('/ads/') || lowerUrl.includes('quangcao') || lowerUrl.includes('promo')) {
             seg.isAd = true;
             seg.adReason = 'Blacklisted_Keyword';
             continue;
         }
-        // Khác thư mục máy chủ với bộ phim chính
         if (dominantDir && seg.dir !== dominantDir) {
             seg.isAd = true;
             seg.adReason = 'Different_Directory';
             continue;
         }
-        // Khác cấu trúc tên file (signature) với bộ phim chính
         if (dominantSig && seg.sig !== dominantSig) {
             seg.isAd = true;
             seg.adReason = 'Different_Filename_Pattern';
@@ -292,8 +281,6 @@ function stripAdsSegmentLevel(m3u8Content, baseUrl) {
         }
     }
 
-    // 3. Quét theo khối ngăn cách bởi DISCONTINUITY (nếu có)
-    // Kể cả khi cùng thư mục và cùng kiểu tên file, nếu 1 khối nằm giữa DISCONTINUITY mà ngắn dưới 120s -> Quảng cáo!
     if (segments.some(s => s.discontinuityBefore)) {
         let blockStart = 0;
         for (let i = 1; i <= segments.length; i++) {
@@ -311,16 +298,12 @@ function stripAdsSegmentLevel(m3u8Content, baseUrl) {
         }
     }
 
-    // 4. Quét đứt gãy chuỗi số thứ tự tên file (Sequential Jump Detector)
-    // Ví dụ: Phim đang chạy 0220.ts, 0221.ts -> chèn 10 file quảng cáo 0001.ts..0010.ts -> rồi quay lại 0222.ts
     for (let i = 0; i < segments.length; i++) {
         if (segments[i].isAd || segments[i].seqNum === null) continue;
         if (i > 0 && segments[i - 1].seqNum !== null) {
             const prevNum = segments[i - 1].seqNum;
             const currNum = segments[i].seqNum;
-            // Nếu số thứ tự tự nhiên lùi về số nhỏ (VD từ 225 về 0 hoặc 1)
             if (currNum < prevNum) {
-                // Nhìn về phía trước tối đa 45 phân đoạn (~120 giây) xem chuỗi số cũ (prevNum + 1) có xuất hiện lại không
                 let resumeIdx = -1;
                 for (let j = i + 1; j < Math.min(segments.length, i + 45); j++) {
                     if (segments[j].seqNum !== null && segments[j].seqNum >= prevNum && segments[j].seqNum <= prevNum + 5) {
@@ -343,7 +326,6 @@ function stripAdsSegmentLevel(m3u8Content, baseUrl) {
     const removedSegments = segments.filter(s => s.isAd);
     const finalSegments = keptSegments.length > 0 ? keptSegments : segments;
 
-    // Ráp lại file M3U8 sạch, mượt, không chứa DISCONTINUITY thừa
     const output = [...headerLines, '#EXT-X-PLAYLIST-TYPE:VOD'];
     let lastKeyLine = null;
     let lastDir = null;
@@ -367,7 +349,6 @@ function stripAdsSegmentLevel(m3u8Content, baseUrl) {
 
     output.push('#EXT-X-ENDLIST');
 
-    // Lấy mẫu các phân đoạn quanh phút 15 (từ phút 13:30 đến 16:30 = 810s đến 990s) để phục vụ kiểm tra
     const minute15Sample = segments
         .filter(s => s.startTime >= 810 && s.startTime <= 990)
         .map(s => ({
@@ -623,7 +604,7 @@ async function getExternalStreams(providerName, baseUrl, slug, searchKeywords, t
                 const encoded = encodeUrlBase64(rawM3u8);
                 results.push({
                     name: `🛡️ [${providerName}] Không QC`,
-                    title: `Tập ${cleanEpName}${srvName} (Lọc sâu từng đoạn - v9.8)`,
+                    title: `Tập ${cleanEpName}${srvName} (Lọc sâu từng đoạn - v9.8.1)`,
                     url: `${PUBLIC_BASE_URL}/hls/${encoded}/master.m3u8`
                 });
             }
@@ -716,204 +697,3 @@ builder.defineMetaHandler(async ({ type, id }) => {
                     id: `nguonc_${slug}:${epNum}`,
                     title: ep.name ? (String(ep.name).toLowerCase().startsWith('tập') ? ep.name : `Tập ${ep.name}`) : `Tập ${epNum}`,
                     season: 1,
-                    episode: epNum
-                });
-            });
-        }
-
-        return {
-            meta: {
-                id: `nguonc_${slug}`,
-                type,
-                name: movie.name,
-                poster: movie.poster_url || movie.thumb_url,
-                background: movie.thumb_url || movie.poster_url,
-                description: movie.description ? movie.description.replace(/<[^>]*>?/gm, '') : '',
-                releaseInfo: movie.quality ? `${movie.quality} | ${movie.language || ''}` : undefined,
-                videos: episodesList.length > 0 ? episodesList : undefined
-            }
-        };
-    } catch (e) {
-        return { meta: null };
-    }
-});
-
-// 3. STREAM HANDLER
-builder.defineStreamHandler(async ({ type, id }) => {
-    try {
-        const streamCacheKey = `stream_v98:${type}:${id}`;
-        const cachedStreams = getCache(streamCacheKey);
-        if (cachedStreams) return { streams: cachedStreams };
-
-        let slug = null;
-        let seasonTarget = 1;
-        let episodeTarget = 1;
-        let imdbName = null;
-        let targetYear = null;
-
-        if (id.startsWith('nguonc_')) {
-            const parts = id.replace('nguonc_', '').split(':');
-            slug = parts[0];
-            if (parts.length > 1) episodeTarget = parseInt(parts[1], 10) || 1;
-        } else if (id.startsWith('tt')) {
-            const parts = id.split(':');
-            const imdbId = parts[0];
-            if (parts.length > 2) {
-                seasonTarget = parseInt(parts[1], 10) || 1;
-                episodeTarget = parseInt(parts[2], 10) || 1;
-            }
-
-            const imdbMeta = await getImdbMeta(type, imdbId);
-            if (!imdbMeta) return { streams: [] };
-            imdbName = imdbMeta.name;
-            targetYear = imdbMeta.year;
-        }
-
-        let nguonCPromise;
-        if (slug) {
-            nguonCPromise = fetchNguonC(`/film/${slug}`);
-        } else if (imdbName) {
-            nguonCPromise = (async () => {
-                const searchData = await fetchNguonC(`/films/search?keyword=${encodeURIComponent(imdbName)}`);
-                const items = searchData?.items || searchData?.data?.items || searchData?.data || [];
-                const best = pickBestSearchMatch(items, [imdbName], targetYear, seasonTarget);
-                if (best?.slug) {
-                    slug = best.slug;
-                    return await fetchNguonC(`/film/${best.slug}`);
-                }
-                return null;
-            })();
-        } else {
-            nguonCPromise = Promise.resolve(null);
-        }
-
-        const detailData = await nguonCPromise;
-        const movie = detailData?.movie || detailData?.film;
-
-        const searchKeywords = [];
-        if (imdbName) searchKeywords.push(imdbName);
-        if (movie?.name && !searchKeywords.includes(movie.name)) searchKeywords.push(movie.name);
-        if (movie?.original_name && !searchKeywords.includes(movie.original_name)) searchKeywords.push(movie.original_name);
-
-        const [kkStreams, ophimStreams] = await Promise.all([
-            getExternalStreams('KK', KKPHIM_API, slug, searchKeywords, targetYear, seasonTarget, episodeTarget, type),
-            getExternalStreams('OP', OPHIM_API, slug, searchKeywords, targetYear, seasonTarget, episodeTarget, type)
-        ]);
-
-        const webStreams = [];
-        const servers = movie?.episodes || detailData?.episodes || [];
-        for (const server of servers) {
-            const epItems = server.items || server.server_data || [];
-            const targetEp = findEpisodeItem(epItems, episodeTarget, type);
-            if (!targetEp) continue;
-
-            const srvName = server.server_name ? ` - ${server.server_name}` : '';
-            const cleanEpName = String(targetEp.name || episodeTarget).replace(/^(tập|tap)\s*/i, '');
-            const embedUrl = targetEp.embed || targetEp.link_embed || '';
-
-            if (embedUrl) {
-                webStreams.push({
-                    name: `🌐 [NguonC] Web`,
-                    title: `Tập ${cleanEpName}${srvName} (Mở trình duyệt)`,
-                    externalUrl: embedUrl
-                });
-            }
-        }
-
-        // Ưu tiên đẩy [OP] Không QC lên trước [KK] vì nguồn OPhim ít nhúng cứng quảng cáo 9922 hơn KKPhim
-        const opClean = ophimStreams.filter(s => s.name.includes('Không QC'));
-        const kkClean = kkStreams.filter(s => s.name.includes('Không QC'));
-        const rawDirectStreams = [...ophimStreams, ...kkStreams].filter(s => !s.name.includes('Không QC'));
-
-        const allStreams = [
-            ...opClean,
-            ...kkClean,
-            ...rawDirectStreams,
-            ...webStreams
-        ];
-
-        const uniqueStreams = [];
-        const seenUrls = new Set();
-        for (const s of allStreams) {
-            const key = s.url || s.externalUrl;
-            if (key && !seenUrls.has(key)) {
-                seenUrls.add(key);
-                uniqueStreams.push(s);
-            }
-        }
-
-        if (uniqueStreams.length > 0) {
-            setCache(streamCacheKey, uniqueStreams, 1800);
-        }
-
-        return { streams: uniqueStreams };
-    } catch (e) {
-        return { streams: [] };
-    }
-});
-
-const app = express();
-app.use((req, res, next) => {
-    if (!PUBLIC_BASE_URL && req.headers.host) {
-        const proto = req.headers['x-forwarded-proto'] || req.protocol || 'https';
-        PUBLIC_BASE_URL = `${proto}://${req.headers.host}`;
-    }
-    res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader('Access-Control-Allow-Headers', '*');
-    next();
-});
-
-app.get('/hls/:encoded/master.m3u8', async (req, res) => {
-    const targetUrl = decodeUrlBase64(req.params.encoded);
-    if (!targetUrl) return res.status(400).send('Invalid stream URL');
-
-    try {
-        const clientIp = (req.headers['x-forwarded-for'] || '').split(',')[0].trim() || req.socket.remoteAddress;
-        const cleanedM3u8 = await buildCleanM3U8(targetUrl, clientIp);
-
-        if (cleanedM3u8) {
-            res.setHeader('Content-Type', 'application/vnd.apple.mpegurl; charset=utf-8');
-            res.setHeader('Cache-Control', 'public, max-age=3600');
-            return res.send(cleanedM3u8);
-        }
-
-        res.redirect(targetUrl);
-    } catch (e) {
-        res.redirect(targetUrl);
-    }
-});
-
-app.get('/clean.m3u8', async (req, res) => {
-    const targetUrl = req.query.url;
-    if (!targetUrl) return res.status(400).send('Missing url');
-
-    try {
-        const clientIp = (req.headers['x-forwarded-for'] || '').split(',')[0].trim() || req.socket.remoteAddress;
-        const cleanedM3u8 = await buildCleanM3U8(targetUrl, clientIp);
-
-        if (cleanedM3u8) {
-            res.setHeader('Content-Type', 'application/vnd.apple.mpegurl; charset=utf-8');
-            res.setHeader('Cache-Control', 'public, max-age=3600');
-            return res.send(cleanedM3u8);
-        }
-
-        res.redirect(targetUrl);
-    } catch (e) {
-        res.redirect(targetUrl);
-    }
-});
-
-// CỔNG SOI CHI TIẾT PHÚT 15 CỦA TẬP PHIM VỪA MỞ (/inspect-last)
-app.get('/inspect-last', (req, res) => {
-    if (!lastPlayedM3U8Info) {
-        return res.json({ message: 'Chưa có tập phim nào được mở qua luồng Không QC kể từ lúc server khởi động.' });
-    }
-    res.json(lastPlayedM3U8Info);
-});
-
-app.get('/health', (req, res) => res.status(200).send('OK'));
-
-const addonRouter = getRouter(builder.getInterface());
-app.use('/', addonRouter);
-
-app.listen(PORT, () => console.log(`Addon NguonC v9.8.0 (Segment AdBlock) running on port ${PORT}`));
