@@ -17,7 +17,7 @@ const httpsAgent = new https.Agent({
 });
 
 const CLIENT_HEADERS = {
-    'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1',
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
     'Accept': '*/*',
     'Accept-Language': 'vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7'
 };
@@ -38,7 +38,9 @@ function setCache(key, value, ttlSeconds = 1800) {
     cache.set(key, { value, expiry: Date.now() + ttlSeconds * 1000 });
 }
 
-// Mã hóa / Giải mã URL sang Base64 URL-Safe (Giúp App ngoài trên iOS không bị lỗi dấu ? và &)
+// Lưu lại M3U8 gần nhất để bạn có thể soi qua /inspect-last
+let lastPlayedM3U8Info = null;
+
 function encodeUrlBase64(url) {
     return Buffer.from(url, 'utf8')
         .toString('base64')
@@ -59,9 +61,9 @@ function decodeUrlBase64(b64) {
 
 const builder = new addonBuilder({
     id: 'org.nguonc.stremio.v86',
-    version: '9.7.0',
-    name: 'NguonC Siêu Nhẹ (iOS & TV AdBlock)',
-    description: 'Chặn triệt để quảng cáo 9922/nhà cái trên iPhone (App ngoài) & Tua mượt trên Android TV',
+    version: '9.8.0',
+    name: 'NguonC Siêu Nhẹ (Deep Segment AdBlock)',
+    description: 'Quét từng phân đoạn .ts (Kể cả khi ẩn thẻ Discontinuity ở phút 15) + Ưu tiên OPhim sạch',
     resources: ['catalog', 'meta', 'stream'],
     types: ['movie', 'series', 'anime'],
     idPrefixes: ['tt', 'nguonc_'],
@@ -138,28 +140,43 @@ function pickBestVariantUrl(masterContent, masterUrl) {
     return bestUrl;
 }
 
-// Tạo chữ ký cấu trúc tên file (giúp phát hiện các phân đoạn quảng cáo khác quy luật đặt tên với phim chính)
-function getFilenameSignature(urlStr) {
+// Phân tích đặc điểm nhận dạng của 1 URL phân đoạn (.ts / .png / .jpg)
+function analyzeSegmentUrl(absUrl) {
     try {
-        const u = new URL(urlStr);
+        const u = new URL(absUrl);
         const parts = u.pathname.split('/');
         const filename = parts.pop() || '';
         const dir = u.origin + parts.join('/');
-        // Thay chữ số bằng '#' để lấy khung tên file (VD: seg-0012.ts -> seg-####.ts)
+
+        // Tách phần chữ khung (pattern) và con số cuối cùng trong tên file
+        const numMatches = [...filename.matchAll(/\d+/g)];
+        const lastNumMatch = numMatches.length > 0 ? numMatches[numMatches.length - 1] : null;
+        const seqNum = lastNumMatch ? parseInt(lastNumMatch[0], 10) : null;
+
+        // Khung chữ ký: thư mục + cấu trúc tên file (thay số bằng #) + độ dài tên file (nếu là mã hash)
         const pattern = filename.replace(/\d+/g, '#');
-        return `${dir}|${pattern}|len:${filename.length}`;
+        const isHexHash = /^[a-f0-9]{16,}\.[a-z0-9]+$/i.test(filename);
+        const sig = isHexHash ? `${dir}|HEX_LEN_${filename.length}` : `${dir}|${pattern}`;
+
+        return { absUrl, dir, filename, sig, seqNum };
     } catch (e) {
-        return urlStr;
+        return { absUrl, dir: '', filename: absUrl, sig: 'unknown', seqNum: null };
     }
 }
 
-// THUẬT TOÁN LỌC QUẢNG CÁO 3 LỚP (TRỊ TRIỆT ĐỂ QUẢNG CÁO 9922 / NHÀ CÁI CHÈN NGẦM)
-function stripAdsDeep(m3u8Content, baseUrl) {
+// THUẬT TOÁN QUÉT TỪNG PHÂN ĐOẠN (SEGMENT-LEVEL SCANNER) - BẤT CHẤP CÓ HAY KHÔNG CÓ DISCONTINUITY
+function stripAdsSegmentLevel(m3u8Content, baseUrl) {
     const lines = m3u8Content.split(/\r?\n/);
     const headerLines = [];
-    const blocks = [];
-    let currentBlock = [];
+    const segments = [];
+
+    let currentExtInf = null;
+    let currentDur = 0;
+    let currentKeyLine = null;
+    let currentByteRange = null;
+    let hasDiscontinuityBefore = false;
     let seenFirstSegment = false;
+    let runningTime = 0;
 
     for (let i = 0; i < lines.length; i++) {
         const line = lines[i].trim();
@@ -167,152 +184,221 @@ function stripAdsDeep(m3u8Content, baseUrl) {
 
         if (line === '#EXT-X-DISCONTINUITY') {
             seenFirstSegment = true;
-            if (currentBlock.length > 0) {
-                blocks.push(currentBlock);
-                currentBlock = [];
+            hasDiscontinuityBefore = true;
+            continue;
+        }
+
+        if (line.startsWith('#EXT-X-KEY')) {
+            seenFirstSegment = true;
+            if (line.includes('URI="')) {
+                currentKeyLine = line.replace(/URI="([^"]+)"/, (m, uri) => {
+                    try { return `URI="${new URL(uri, baseUrl).href}"`; } catch (e) { return m; }
+                });
+            } else {
+                currentKeyLine = line;
             }
             continue;
         }
 
-        if (!seenFirstSegment && line.startsWith('#') && !line.startsWith('#EXTINF') && !line.startsWith('#EXT-X-KEY') && !line.startsWith('#EXT-X-BYTERANGE')) {
-            if (!line.startsWith('#EXT-X-PLAYLIST-TYPE')) {
+        if (line.startsWith('#EXT-X-BYTERANGE')) {
+            seenFirstSegment = true;
+            currentByteRange = line;
+            continue;
+        }
+
+        if (line.startsWith('#EXTINF:')) {
+            seenFirstSegment = true;
+            currentExtInf = line;
+            const d = parseFloat(line.substring(8).split(',')[0]);
+            currentDur = isNaN(d) ? 0 : d;
+            continue;
+        }
+
+        if (line.startsWith('#')) {
+            if (!seenFirstSegment && !line.startsWith('#EXT-X-PLAYLIST-TYPE')) {
                 headerLines.push(line);
             }
             continue;
         }
 
+        // Đây là dòng URL của phân đoạn (.ts)
         seenFirstSegment = true;
-        currentBlock.push(line);
-    }
-    if (currentBlock.length > 0) blocks.push(currentBlock);
+        let absUrl = line;
+        try { absUrl = new URL(line, baseUrl).href; } catch (e) {}
 
-    const analyzedBlocks = blocks.map(block => {
-        let duration = 0;
-        let segCount = 0;
-        const urls = [];
-        for (const l of block) {
-            if (l.startsWith('#EXTINF:')) {
-                const dur = parseFloat(l.substring(8).split(',')[0]);
-                if (!isNaN(dur)) duration += dur;
-            } else if (!l.startsWith('#')) {
-                segCount++;
-                try {
-                    urls.push(new URL(l, baseUrl).href);
-                } catch (e) {
-                    urls.push(l);
+        const info = analyzeSegmentUrl(absUrl);
+        segments.push({
+            index: segments.length,
+            startTime: runningTime,
+            duration: currentDur,
+            extInf: currentExtInf || `#EXTINF:${currentDur.toFixed(3)},`,
+            keyLine: currentKeyLine,
+            byteRange: currentByteRange,
+            discontinuityBefore: hasDiscontinuityBefore,
+            ...info,
+            isAd: false,
+            adReason: ''
+        });
+
+        runningTime += currentDur;
+        currentExtInf = null;
+        currentDur = 0;
+        currentByteRange = null;
+        hasDiscontinuityBefore = false;
+    }
+
+    if (segments.length === 0) return { cleanedM3u8: m3u8Content, stats: { total: 0, removed: 0 } };
+
+    // 1. Tìm Chữ ký (Signature) và Thư mục (Dir) chủ đạo của bộ phim chính
+    const sigDurations = {};
+    const dirDurations = {};
+    for (const seg of segments) {
+        sigDurations[seg.sig] = (sigDurations[seg.sig] || 0) + seg.duration;
+        dirDurations[seg.dir] = (dirDurations[seg.dir] || 0) + seg.duration;
+    }
+
+    let dominantSig = '';
+    let maxSigDur = -1;
+    for (const [s, d] of Object.entries(sigDurations)) {
+        if (d > maxSigDur) { maxSigDur = d; dominantSig = s; }
+    }
+
+    let dominantDir = '';
+    let maxDirDur = -1;
+    for (const [dir, d] of Object.entries(dirDurations)) {
+        if (d > maxDirDur) { maxDirDur = d; dominantDir = dir; }
+    }
+
+    // 2. Đánh dấu từng phân đoạn nghi vấn là quảng cáo:
+    for (const seg of segments) {
+        const lowerUrl = seg.absUrl.toLowerCase();
+        // Lọc từ khóa đen
+        if (lowerUrl.includes('9922') || lowerUrl.includes('/adjump/') || lowerUrl.includes('/ads/') || lowerUrl.includes('quangcao') || lowerUrl.includes('promo')) {
+            seg.isAd = true;
+            seg.adReason = 'Blacklisted_Keyword';
+            continue;
+        }
+        // Khác thư mục máy chủ với bộ phim chính
+        if (dominantDir && seg.dir !== dominantDir) {
+            seg.isAd = true;
+            seg.adReason = 'Different_Directory';
+            continue;
+        }
+        // Khác cấu trúc tên file (signature) với bộ phim chính
+        if (dominantSig && seg.sig !== dominantSig) {
+            seg.isAd = true;
+            seg.adReason = 'Different_Filename_Pattern';
+            continue;
+        }
+    }
+
+    // 3. Quét theo khối ngăn cách bởi DISCONTINUITY (nếu có)
+    // Kể cả khi cùng thư mục và cùng kiểu tên file, nếu 1 khối nằm giữa DISCONTINUITY mà ngắn dưới 120s -> Quảng cáo!
+    if (segments.some(s => s.discontinuityBefore)) {
+        let blockStart = 0;
+        for (let i = 1; i <= segments.length; i++) {
+            if (i === segments.length || segments[i].discontinuityBefore) {
+                const blockSegs = segments.slice(blockStart, i);
+                const blockDur = blockSegs.reduce((sum, s) => sum + s.duration, 0);
+                if (runningTime > 200 && blockDur < 110) {
+                    for (const s of blockSegs) {
+                        s.isAd = true;
+                        s.adReason = `Short_Discontinuity_Block(${blockDur.toFixed(1)}s)`;
+                    }
+                }
+                blockStart = i;
+            }
+        }
+    }
+
+    // 4. Quét đứt gãy chuỗi số thứ tự tên file (Sequential Jump Detector)
+    // Ví dụ: Phim đang chạy 0220.ts, 0221.ts -> chèn 10 file quảng cáo 0001.ts..0010.ts -> rồi quay lại 0222.ts
+    for (let i = 0; i < segments.length; i++) {
+        if (segments[i].isAd || segments[i].seqNum === null) continue;
+        if (i > 0 && segments[i - 1].seqNum !== null) {
+            const prevNum = segments[i - 1].seqNum;
+            const currNum = segments[i].seqNum;
+            // Nếu số thứ tự tự nhiên lùi về số nhỏ (VD từ 225 về 0 hoặc 1)
+            if (currNum < prevNum) {
+                // Nhìn về phía trước tối đa 45 phân đoạn (~120 giây) xem chuỗi số cũ (prevNum + 1) có xuất hiện lại không
+                let resumeIdx = -1;
+                for (let j = i + 1; j < Math.min(segments.length, i + 45); j++) {
+                    if (segments[j].seqNum !== null && segments[j].seqNum >= prevNum && segments[j].seqNum <= prevNum + 5) {
+                        resumeIdx = j;
+                        break;
+                    }
+                }
+                if (resumeIdx !== -1) {
+                    for (let k = i; k < resumeIdx; k++) {
+                        segments[k].isAd = true;
+                        segments[k].adReason = `Sequence_Reset_Ad(${prevNum}->${currNum})`;
+                    }
+                    i = resumeIdx - 1;
                 }
             }
         }
-        let prefix = '';
-        let sig = '';
-        if (urls.length > 0) {
-            try {
-                const u = new URL(urls[0]);
-                const pathParts = u.pathname.split('/');
-                pathParts.pop();
-                prefix = u.origin + pathParts.join('/');
-                sig = getFilenameSignature(urls[0]);
-            } catch (e) {}
-        }
-        const avgSegDur = segCount > 0 ? duration / segCount : 0;
-        return { rawLines: block, duration, segCount, prefix, sig, avgSegDur, urls };
-    }).filter(b => b.segCount > 0);
-
-    // Tính tổng thời lượng phim để nhận diện
-    const totalDuration = analyzedBlocks.reduce((acc, b) => acc + b.duration, 0);
-
-    // Tìm prefix và chữ ký tên file của bộ phim chính (chiếm thời lượng lớn nhất)
-    const sigTotals = {};
-    const prefixTotals = {};
-    for (const b of analyzedBlocks) {
-        sigTotals[b.sig] = (sigTotals[b.sig] || 0) + b.duration;
-        prefixTotals[b.prefix] = (prefixTotals[b.prefix] || 0) + b.duration;
     }
 
-    let mainSig = '';
-    let maxSigDur = -1;
-    for (const [s, d] of Object.entries(sigTotals)) {
-        if (d > maxSigDur) {
-            maxSigDur = d;
-            mainSig = s;
-        }
-    }
+    const keptSegments = segments.filter(s => !s.isAd);
+    const removedSegments = segments.filter(s => s.isAd);
+    const finalSegments = keptSegments.length > 0 ? keptSegments : segments;
 
-    let mainPrefix = '';
-    let maxPrefDur = -1;
-    for (const [p, d] of Object.entries(prefixTotals)) {
-        if (d > maxPrefDur) {
-            maxPrefDur = d;
-            mainPrefix = p;
-        }
-    }
-
-    // LỌC BỎ CÁC KHỐI QUẢNG CÁO CHÈN GIỮA HOẶC ĐẦU PHIM:
-    const cleanBlocks = analyzedBlocks.filter(b => {
-        if (analyzedBlocks.length <= 1) return true;
-
-        // 1. Nếu bộ phim dài (> 3 phút), bất kỳ khối DISCONTINUITY nào ngắn dưới 95 giây (dù chia bao nhiêu phân đoạn) đều là quảng cáo!
-        if (totalDuration > 180 && b.duration < 95) {
-            return false;
-        }
-
-        // 2. Nếu khác thư mục máy chủ với phim chính và ngắn dưới 180 giây -> Quảng cáo!
-        if (mainPrefix && b.prefix && b.prefix !== mainPrefix && b.duration < 180) {
-            return false;
-        }
-
-        // 3. Nếu khác quy luật đặt tên file (signature) với phim chính và ngắn dưới 180 giây -> Quảng cáo!
-        if (mainSig && b.sig && b.sig !== mainSig && b.duration < 180) {
-            return false;
-        }
-
-        // 4. Kiểm tra từ khóa đen trong đường dẫn phân đoạn
-        const sampleUrl = (b.urls[0] || '').toLowerCase();
-        if (sampleUrl.includes('9922') || sampleUrl.includes('/adjump/') || sampleUrl.includes('/ads/') || sampleUrl.includes('promo')) {
-            return false;
-        }
-
-        return true;
-    });
-
-    const finalBlocks = cleanBlocks.length > 0 ? cleanBlocks : analyzedBlocks;
-
-    // Đóng gói lại file M3U8 hoàn chỉnh (Loại bỏ #EXT-X-DISCONTINUITY thừa để tua mượt)
+    // Ráp lại file M3U8 sạch, mượt, không chứa DISCONTINUITY thừa
     const output = [...headerLines, '#EXT-X-PLAYLIST-TYPE:VOD'];
-    let prevPrefix = null;
+    let lastKeyLine = null;
+    let lastDir = null;
 
-    finalBlocks.forEach((b, idx) => {
-        if (idx > 0 && prevPrefix && b.prefix && prevPrefix !== b.prefix) {
+    finalSegments.forEach((seg, idx) => {
+        if (idx > 0 && lastDir && seg.dir && lastDir !== seg.dir) {
             output.push('#EXT-X-DISCONTINUITY');
         }
-        prevPrefix = b.prefix;
+        lastDir = seg.dir;
 
-        for (const l of b.rawLines) {
-            if (l.startsWith('#')) {
-                if (l.startsWith('#EXT-X-KEY') && l.includes('URI="')) {
-                    const replaced = l.replace(/URI="([^"]+)"/, (m, uri) => {
-                        try { return `URI="${new URL(uri, baseUrl).href}"`; } catch (e) { return m; }
-                    });
-                    output.push(replaced);
-                } else {
-                    output.push(l);
-                }
-            } else {
-                try {
-                    output.push(new URL(l, baseUrl).href);
-                } catch (e) {
-                    output.push(l);
-                }
-            }
+        if (seg.keyLine && seg.keyLine !== lastKeyLine) {
+            output.push(seg.keyLine);
+            lastKeyLine = seg.keyLine;
         }
+        if (seg.byteRange) {
+            output.push(seg.byteRange);
+        }
+        output.push(seg.extInf);
+        output.push(seg.absUrl);
     });
 
     output.push('#EXT-X-ENDLIST');
-    return output.join('\n');
+
+    // Lấy mẫu các phân đoạn quanh phút 15 (từ phút 13:30 đến 16:30 = 810s đến 990s) để phục vụ kiểm tra
+    const minute15Sample = segments
+        .filter(s => s.startTime >= 810 && s.startTime <= 990)
+        .map(s => ({
+            idx: s.index,
+            time: `${Math.floor(s.startTime / 60)}m${Math.floor(s.startTime % 60)}s`,
+            dur: s.duration,
+            disc: s.discontinuityBefore,
+            isAd: s.isAd,
+            reason: s.adReason,
+            file: s.filename,
+            url: s.absUrl
+        }));
+
+    return {
+        cleanedM3u8: output.join('\n'),
+        stats: {
+            totalSegments: segments.length,
+            removedCount: removedSegments.length,
+            removedSamples: removedSegments.slice(0, 20).map(s => ({
+                idx: s.index,
+                time: `${Math.floor(s.startTime / 60)}m${Math.floor(s.startTime % 60)}s`,
+                reason: s.adReason,
+                url: s.absUrl
+            })),
+            minute15Window: minute15Sample
+        }
+    };
 }
 
 async function buildCleanM3U8(masterOrMediaUrl, clientIp) {
-    const cacheKey = `clean_v97:${masterOrMediaUrl}`;
+    const cacheKey = `clean_v98:${masterOrMediaUrl}`;
     const cached = getCache(cacheKey);
     if (cached) return cached;
 
@@ -349,9 +435,15 @@ async function buildCleanM3U8(masterOrMediaUrl, clientIp) {
     }
 
     if (typeof content === 'string' && content.includes('#EXTM3U')) {
-        const cleaned = stripAdsDeep(content, finalBaseUrl);
-        setCache(cacheKey, cleaned, 3600);
-        return cleaned;
+        const result = stripAdsSegmentLevel(content, finalBaseUrl);
+        lastPlayedM3U8Info = {
+            masterUrl: masterOrMediaUrl,
+            mediaUrl: finalBaseUrl,
+            timestamp: new Date().toISOString(),
+            stats: result.stats
+        };
+        setCache(cacheKey, result.cleanedM3u8, 3600);
+        return result.cleanedM3u8;
     }
 
     return null;
@@ -527,19 +619,18 @@ async function getExternalStreams(providerName, baseUrl, slug, searchKeywords, t
             const cleanEpName = String(targetEp.name || episodeTarget).replace(/^(tập|tap)\s*/i, '');
             const rawM3u8 = targetEp.link_m3u8;
 
-            // Sử dụng đường dẫn tĩnh /hls/<base64>/master.m3u8 giúp App ngoài trên iOS (Outplayer/VLC) nhận diện chuẩn 100%
             if (PUBLIC_BASE_URL) {
                 const encoded = encodeUrlBase64(rawM3u8);
                 results.push({
                     name: `🛡️ [${providerName}] Không QC`,
-                    title: `Tập ${cleanEpName}${srvName} (Đã cắt QC 9922 - Tua mượt)`,
+                    title: `Tập ${cleanEpName}${srvName} (Lọc sâu từng đoạn - v9.8)`,
                     url: `${PUBLIC_BASE_URL}/hls/${encoded}/master.m3u8`
                 });
             }
 
             results.push({
                 name: `⚡ [${providerName}] Direct`,
-                title: `Tập ${cleanEpName}${srvName} (Luồng gốc có QC)`,
+                title: `Tập ${cleanEpName}${srvName} (Luồng gốc)`,
                 url: rawM3u8
             });
         }
@@ -650,7 +741,7 @@ builder.defineMetaHandler(async ({ type, id }) => {
 // 3. STREAM HANDLER
 builder.defineStreamHandler(async ({ type, id }) => {
     try {
-        const streamCacheKey = `stream_v97:${type}:${id}`;
+        const streamCacheKey = `stream_v98:${type}:${id}`;
         const cachedStreams = getCache(streamCacheKey);
         if (cachedStreams) return { streams: cachedStreams };
 
@@ -729,11 +820,14 @@ builder.defineStreamHandler(async ({ type, id }) => {
             }
         }
 
-        const cleanStreams = [...kkStreams, ...ophimStreams].filter(s => s.name.includes('Không QC'));
-        const rawDirectStreams = [...kkStreams, ...ophimStreams].filter(s => !s.name.includes('Không QC'));
+        // Ưu tiên đẩy [OP] Không QC lên trước [KK] vì nguồn OPhim ít nhúng cứng quảng cáo 9922 hơn KKPhim
+        const opClean = ophimStreams.filter(s => s.name.includes('Không QC'));
+        const kkClean = kkStreams.filter(s => s.name.includes('Không QC'));
+        const rawDirectStreams = [...ophimStreams, ...kkStreams].filter(s => !s.name.includes('Không QC'));
 
         const allStreams = [
-            ...cleanStreams,
+            ...opClean,
+            ...kkClean,
             ...rawDirectStreams,
             ...webStreams
         ];
@@ -769,7 +863,6 @@ app.use((req, res, next) => {
     next();
 });
 
-// ROUTE CHUẨN CHO APP NGOÀI TRÊN IPHONE (Outplayer / VLC / Infuse): /hls/:encoded/master.m3u8
 app.get('/hls/:encoded/master.m3u8', async (req, res) => {
     const targetUrl = decodeUrlBase64(req.params.encoded);
     if (!targetUrl) return res.status(400).send('Invalid stream URL');
@@ -790,7 +883,6 @@ app.get('/hls/:encoded/master.m3u8', async (req, res) => {
     }
 });
 
-// Giữ lại route /clean.m3u8 để tương thích ngược
 app.get('/clean.m3u8', async (req, res) => {
     const targetUrl = req.query.url;
     if (!targetUrl) return res.status(400).send('Missing url');
@@ -811,9 +903,17 @@ app.get('/clean.m3u8', async (req, res) => {
     }
 });
 
+// CỔNG SOI CHI TIẾT PHÚT 15 CỦA TẬP PHIM VỪA MỞ (/inspect-last)
+app.get('/inspect-last', (req, res) => {
+    if (!lastPlayedM3U8Info) {
+        return res.json({ message: 'Chưa có tập phim nào được mở qua luồng Không QC kể từ lúc server khởi động.' });
+    }
+    res.json(lastPlayedM3U8Info);
+});
+
 app.get('/health', (req, res) => res.status(200).send('OK'));
 
 const addonRouter = getRouter(builder.getInterface());
 app.use('/', addonRouter);
 
-app.listen(PORT, () => console.log(`Addon NguonC v9.7.0 (iOS & TV AdBlock) running on port ${PORT}`));
+app.listen(PORT, () => console.log(`Addon NguonC v9.8.0 (Segment AdBlock) running on port ${PORT}`));
