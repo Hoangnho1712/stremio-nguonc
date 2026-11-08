@@ -10,11 +10,15 @@ const PORT = process.env.PORT || 7000;
 
 let PUBLIC_BASE_URL = (process.env.RENDER_EXTERNAL_URL || '').replace(/\/$/, '');
 
-const httpsAgent = new https.Agent({ keepAlive: true, rejectUnauthorized: false });
+const httpsAgent = new https.Agent({
+    keepAlive: true,
+    maxSockets: 100,
+    rejectUnauthorized: false
+});
 
 const CLIENT_HEADERS = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
-    'Accept': 'application/json, text/plain, */*',
+    'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1',
+    'Accept': '*/*',
     'Accept-Language': 'vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7'
 };
 
@@ -30,15 +34,34 @@ function getCache(key) {
     return item.value;
 }
 function setCache(key, value, ttlSeconds = 1800) {
-    if (cache.size > 1500) cache.clear();
+    if (cache.size > 2000) cache.clear();
     cache.set(key, { value, expiry: Date.now() + ttlSeconds * 1000 });
+}
+
+// Mã hóa / Giải mã URL sang Base64 URL-Safe (Giúp App ngoài trên iOS không bị lỗi dấu ? và &)
+function encodeUrlBase64(url) {
+    return Buffer.from(url, 'utf8')
+        .toString('base64')
+        .replace(/\+/g, '-')
+        .replace(/\//g, '_')
+        .replace(/=+$/, '');
+}
+
+function decodeUrlBase64(b64) {
+    try {
+        let str = b64.replace(/-/g, '+').replace(/_/g, '/');
+        while (str.length % 4) str += '=';
+        return Buffer.from(str, 'base64').toString('utf8');
+    } catch (e) {
+        return null;
+    }
 }
 
 const builder = new addonBuilder({
     id: 'org.nguonc.stremio.v86',
-    version: '9.5.0',
-    name: 'NguonC Siêu Nhẹ (AdBlock Direct)',
-    description: 'Tự động lọc bỏ quảng cáo ngầm trong luồng Direct (KKPhim/OPhim) + Chống sập',
+    version: '9.7.0',
+    name: 'NguonC Siêu Nhẹ (iOS & TV AdBlock)',
+    description: 'Chặn triệt để quảng cáo 9922/nhà cái trên iPhone (App ngoài) & Tua mượt trên Android TV',
     resources: ['catalog', 'meta', 'stream'],
     types: ['movie', 'series', 'anime'],
     idPrefixes: ['tt', 'nguonc_'],
@@ -86,25 +109,53 @@ function findEpisodeItem(epItems, episodeTarget, type) {
     return null;
 }
 
-// THUẬT TOÁN LỌC BỎ QUẢNG CÁO CHÈN NGẦM TRONG FILE M3U8 (#EXT-X-DISCONTINUITY)
-function stripAdsFromM3U8(m3u8Content, baseUrl, proxyBaseUrl) {
-    const lines = m3u8Content.split(/\r?\n/);
+function pickBestVariantUrl(masterContent, masterUrl) {
+    const lines = masterContent.split(/\r?\n/);
+    let bestUrl = null;
+    let maxBandwidth = -1;
 
-    // 1. Nếu là Master Playlist (chứa các luồng độ phân giải con) -> viết lại link trỏ về bộ lọc
-    if (m3u8Content.includes('#EXT-X-STREAM-INF')) {
-        return lines.map(line => {
-            const trimmed = line.trim();
-            if (!trimmed || trimmed.startsWith('#')) return line;
-            try {
-                const absUrl = new URL(trimmed, baseUrl).href;
-                return `${proxyBaseUrl}/clean.m3u8?url=${encodeURIComponent(absUrl)}`;
-            } catch (e) {
-                return line;
+    for (let i = 0; i < lines.length; i++) {
+        const line = lines[i].trim();
+        if (line.startsWith('#EXT-X-STREAM-INF')) {
+            const bwMatch = line.match(/BANDWIDTH=(\d+)/i);
+            const bw = bwMatch ? parseInt(bwMatch[1], 10) : 0;
+            for (let j = i + 1; j < lines.length; j++) {
+                const nextLine = lines[j].trim();
+                if (!nextLine) continue;
+                if (!nextLine.startsWith('#')) {
+                    try {
+                        const abs = new URL(nextLine, masterUrl).href;
+                        if (bw >= maxBandwidth) {
+                            maxBandwidth = bw;
+                            bestUrl = abs;
+                        }
+                    } catch (e) {}
+                }
+                break;
             }
-        }).join('\n');
+        }
     }
+    return bestUrl;
+}
 
-    // 2. Nếu là Media Playlist (chứa các phân đoạn .ts / .png / .jpg)
+// Tạo chữ ký cấu trúc tên file (giúp phát hiện các phân đoạn quảng cáo khác quy luật đặt tên với phim chính)
+function getFilenameSignature(urlStr) {
+    try {
+        const u = new URL(urlStr);
+        const parts = u.pathname.split('/');
+        const filename = parts.pop() || '';
+        const dir = u.origin + parts.join('/');
+        // Thay chữ số bằng '#' để lấy khung tên file (VD: seg-0012.ts -> seg-####.ts)
+        const pattern = filename.replace(/\d+/g, '#');
+        return `${dir}|${pattern}|len:${filename.length}`;
+    } catch (e) {
+        return urlStr;
+    }
+}
+
+// THUẬT TOÁN LỌC QUẢNG CÁO 3 LỚP (TRỊ TRIỆT ĐỂ QUẢNG CÁO 9922 / NHÀ CÁI CHÈN NGẦM)
+function stripAdsDeep(m3u8Content, baseUrl) {
+    const lines = m3u8Content.split(/\r?\n/);
     const headerLines = [];
     const blocks = [];
     let currentBlock = [];
@@ -112,9 +163,7 @@ function stripAdsFromM3U8(m3u8Content, baseUrl, proxyBaseUrl) {
 
     for (let i = 0; i < lines.length; i++) {
         const line = lines[i].trim();
-        if (!line) continue;
-
-        if (line === '#EXT-X-ENDLIST') continue;
+        if (!line || line === '#EXT-X-ENDLIST') continue;
 
         if (line === '#EXT-X-DISCONTINUITY') {
             seenFirstSegment = true;
@@ -126,7 +175,9 @@ function stripAdsFromM3U8(m3u8Content, baseUrl, proxyBaseUrl) {
         }
 
         if (!seenFirstSegment && line.startsWith('#') && !line.startsWith('#EXTINF') && !line.startsWith('#EXT-X-KEY') && !line.startsWith('#EXT-X-BYTERANGE')) {
-            headerLines.push(line);
+            if (!line.startsWith('#EXT-X-PLAYLIST-TYPE')) {
+                headerLines.push(line);
+            }
             continue;
         }
 
@@ -135,7 +186,6 @@ function stripAdsFromM3U8(m3u8Content, baseUrl, proxyBaseUrl) {
     }
     if (currentBlock.length > 0) blocks.push(currentBlock);
 
-    // Phân tích từng khối phân đoạn (ngăn cách bởi DISCONTINUITY)
     const analyzedBlocks = blocks.map(block => {
         let duration = 0;
         let segCount = 0;
@@ -153,53 +203,92 @@ function stripAdsFromM3U8(m3u8Content, baseUrl, proxyBaseUrl) {
                 }
             }
         }
-        // Lấy thư mục gốc của các phân đoạn trong khối để nhận diện nguồn
         let prefix = '';
+        let sig = '';
         if (urls.length > 0) {
             try {
                 const u = new URL(urls[0]);
                 const pathParts = u.pathname.split('/');
                 pathParts.pop();
                 prefix = u.origin + pathParts.join('/');
+                sig = getFilenameSignature(urls[0]);
             } catch (e) {}
         }
-        return { rawLines: block, duration, segCount, prefix };
+        const avgSegDur = segCount > 0 ? duration / segCount : 0;
+        return { rawLines: block, duration, segCount, prefix, sig, avgSegDur, urls };
     }).filter(b => b.segCount > 0);
 
-    // Tìm prefix (thư mục máy chủ) của bộ phim chính (chiếm tổng thời lượng lớn nhất)
+    // Tính tổng thời lượng phim để nhận diện
+    const totalDuration = analyzedBlocks.reduce((acc, b) => acc + b.duration, 0);
+
+    // Tìm prefix và chữ ký tên file của bộ phim chính (chiếm thời lượng lớn nhất)
+    const sigTotals = {};
     const prefixTotals = {};
     for (const b of analyzedBlocks) {
+        sigTotals[b.sig] = (sigTotals[b.sig] || 0) + b.duration;
         prefixTotals[b.prefix] = (prefixTotals[b.prefix] || 0) + b.duration;
     }
-    let mainPrefix = '';
-    let maxDur = -1;
-    for (const [pref, dur] of Object.entries(prefixTotals)) {
-        if (dur > maxDur) {
-            maxDur = dur;
-            mainPrefix = pref;
+
+    let mainSig = '';
+    let maxSigDur = -1;
+    for (const [s, d] of Object.entries(sigTotals)) {
+        if (d > maxSigDur) {
+            maxSigDur = d;
+            mainSig = s;
         }
     }
 
-    // Lọc bỏ các khối quảng cáo:
-    // - Khối khác thư mục gốc với phim chính VÀ ngắn dưới 90 giây
-    // - Hoặc khối chèn giữa rất ngắn (dưới 45 giây, ít hơn 12 phân đoạn) khi có nhiều khối trong phim
+    let mainPrefix = '';
+    let maxPrefDur = -1;
+    for (const [p, d] of Object.entries(prefixTotals)) {
+        if (d > maxPrefDur) {
+            maxPrefDur = d;
+            mainPrefix = p;
+        }
+    }
+
+    // LỌC BỎ CÁC KHỐI QUẢNG CÁO CHÈN GIỮA HOẶC ĐẦU PHIM:
     const cleanBlocks = analyzedBlocks.filter(b => {
         if (analyzedBlocks.length <= 1) return true;
-        const isDifferentServer = mainPrefix && b.prefix && b.prefix !== mainPrefix;
-        if (isDifferentServer && b.duration < 120) return false;
-        if (b.duration <= 45 && b.segCount <= 12 && maxDur > 180) return false;
+
+        // 1. Nếu bộ phim dài (> 3 phút), bất kỳ khối DISCONTINUITY nào ngắn dưới 95 giây (dù chia bao nhiêu phân đoạn) đều là quảng cáo!
+        if (totalDuration > 180 && b.duration < 95) {
+            return false;
+        }
+
+        // 2. Nếu khác thư mục máy chủ với phim chính và ngắn dưới 180 giây -> Quảng cáo!
+        if (mainPrefix && b.prefix && b.prefix !== mainPrefix && b.duration < 180) {
+            return false;
+        }
+
+        // 3. Nếu khác quy luật đặt tên file (signature) với phim chính và ngắn dưới 180 giây -> Quảng cáo!
+        if (mainSig && b.sig && b.sig !== mainSig && b.duration < 180) {
+            return false;
+        }
+
+        // 4. Kiểm tra từ khóa đen trong đường dẫn phân đoạn
+        const sampleUrl = (b.urls[0] || '').toLowerCase();
+        if (sampleUrl.includes('9922') || sampleUrl.includes('/adjump/') || sampleUrl.includes('/ads/') || sampleUrl.includes('promo')) {
+            return false;
+        }
+
         return true;
     });
 
     const finalBlocks = cleanBlocks.length > 0 ? cleanBlocks : analyzedBlocks;
 
-    // Ráp lại file M3U8 sạch với URL tuyệt đối
-    const output = [...headerLines];
+    // Đóng gói lại file M3U8 hoàn chỉnh (Loại bỏ #EXT-X-DISCONTINUITY thừa để tua mượt)
+    const output = [...headerLines, '#EXT-X-PLAYLIST-TYPE:VOD'];
+    let prevPrefix = null;
+
     finalBlocks.forEach((b, idx) => {
-        if (idx > 0) output.push('#EXT-X-DISCONTINUITY');
+        if (idx > 0 && prevPrefix && b.prefix && prevPrefix !== b.prefix) {
+            output.push('#EXT-X-DISCONTINUITY');
+        }
+        prevPrefix = b.prefix;
+
         for (const l of b.rawLines) {
             if (l.startsWith('#')) {
-                // Nếu có thẻ #EXT-X-KEY chứa URI tương đối -> chuyển thành tuyệt đối
                 if (l.startsWith('#EXT-X-KEY') && l.includes('URI="')) {
                     const replaced = l.replace(/URI="([^"]+)"/, (m, uri) => {
                         try { return `URI="${new URL(uri, baseUrl).href}"`; } catch (e) { return m; }
@@ -220,6 +309,52 @@ function stripAdsFromM3U8(m3u8Content, baseUrl, proxyBaseUrl) {
 
     output.push('#EXT-X-ENDLIST');
     return output.join('\n');
+}
+
+async function buildCleanM3U8(masterOrMediaUrl, clientIp) {
+    const cacheKey = `clean_v97:${masterOrMediaUrl}`;
+    const cached = getCache(cacheKey);
+    if (cached) return cached;
+
+    const reqHeaders = { ...CLIENT_HEADERS };
+    if (clientIp) {
+        reqHeaders['X-Forwarded-For'] = clientIp;
+        reqHeaders['X-Real-IP'] = clientIp;
+    }
+
+    const res1 = await axios.get(masterOrMediaUrl, {
+        headers: reqHeaders,
+        httpsAgent,
+        responseType: 'text',
+        timeout: 8000
+    });
+
+    let content = res1.data;
+    let finalBaseUrl = masterOrMediaUrl;
+
+    if (typeof content === 'string' && content.includes('#EXT-X-STREAM-INF')) {
+        const variantUrl = pickBestVariantUrl(content, masterOrMediaUrl);
+        if (variantUrl) {
+            const res2 = await axios.get(variantUrl, {
+                headers: reqHeaders,
+                httpsAgent,
+                responseType: 'text',
+                timeout: 8000
+            });
+            if (typeof res2.data === 'string' && res2.data.includes('#EXTM3U')) {
+                content = res2.data;
+                finalBaseUrl = variantUrl;
+            }
+        }
+    }
+
+    if (typeof content === 'string' && content.includes('#EXTM3U')) {
+        const cleaned = stripAdsDeep(content, finalBaseUrl);
+        setCache(cacheKey, cleaned, 3600);
+        return cleaned;
+    }
+
+    return null;
 }
 
 async function fetchNguonC(endpoint) {
@@ -392,19 +527,19 @@ async function getExternalStreams(providerName, baseUrl, slug, searchKeywords, t
             const cleanEpName = String(targetEp.name || episodeTarget).replace(/^(tập|tap)\s*/i, '');
             const rawM3u8 = targetEp.link_m3u8;
 
-            // Luồng 1: Đã lọc sạch quảng cáo chèn ngầm (Khuyên dùng)
+            // Sử dụng đường dẫn tĩnh /hls/<base64>/master.m3u8 giúp App ngoài trên iOS (Outplayer/VLC) nhận diện chuẩn 100%
             if (PUBLIC_BASE_URL) {
+                const encoded = encodeUrlBase64(rawM3u8);
                 results.push({
                     name: `🛡️ [${providerName}] Không QC`,
-                    title: `Tập ${cleanEpName}${srvName} (Đã cắt Quảng Cáo)`,
-                    url: `${PUBLIC_BASE_URL}/clean.m3u8?url=${encodeURIComponent(rawM3u8)}`
+                    title: `Tập ${cleanEpName}${srvName} (Đã cắt QC 9922 - Tua mượt)`,
+                    url: `${PUBLIC_BASE_URL}/hls/${encoded}/master.m3u8`
                 });
             }
 
-            // Luồng 2: Luồng gốc dự phòng
             results.push({
                 name: `⚡ [${providerName}] Direct`,
-                title: `Tập ${cleanEpName}${srvName} (Luồng gốc)`,
+                title: `Tập ${cleanEpName}${srvName} (Luồng gốc có QC)`,
                 url: rawM3u8
             });
         }
@@ -515,7 +650,7 @@ builder.defineMetaHandler(async ({ type, id }) => {
 // 3. STREAM HANDLER
 builder.defineStreamHandler(async ({ type, id }) => {
     try {
-        const streamCacheKey = `stream_v95:${type}:${id}`;
+        const streamCacheKey = `stream_v97:${type}:${id}`;
         const cachedStreams = getCache(streamCacheKey);
         if (cachedStreams) return { streams: cachedStreams };
 
@@ -594,7 +729,6 @@ builder.defineStreamHandler(async ({ type, id }) => {
             }
         }
 
-        // Ưu tiên đẩy các luồng 🛡️ Không Quảng Cáo lên đầu tiên
         const cleanStreams = [...kkStreams, ...ophimStreams].filter(s => s.name.includes('Không QC'));
         const rawDirectStreams = [...kkStreams, ...ophimStreams].filter(s => !s.name.includes('Không QC'));
 
@@ -635,27 +769,39 @@ app.use((req, res, next) => {
     next();
 });
 
-// TRẠM LỌC SẠCH QUẢNG CÁO TRONG PLAYLIST M3U8 (/clean.m3u8)
+// ROUTE CHUẨN CHO APP NGOÀI TRÊN IPHONE (Outplayer / VLC / Infuse): /hls/:encoded/master.m3u8
+app.get('/hls/:encoded/master.m3u8', async (req, res) => {
+    const targetUrl = decodeUrlBase64(req.params.encoded);
+    if (!targetUrl) return res.status(400).send('Invalid stream URL');
+
+    try {
+        const clientIp = (req.headers['x-forwarded-for'] || '').split(',')[0].trim() || req.socket.remoteAddress;
+        const cleanedM3u8 = await buildCleanM3U8(targetUrl, clientIp);
+
+        if (cleanedM3u8) {
+            res.setHeader('Content-Type', 'application/vnd.apple.mpegurl; charset=utf-8');
+            res.setHeader('Cache-Control', 'public, max-age=3600');
+            return res.send(cleanedM3u8);
+        }
+
+        res.redirect(targetUrl);
+    } catch (e) {
+        res.redirect(targetUrl);
+    }
+});
+
+// Giữ lại route /clean.m3u8 để tương thích ngược
 app.get('/clean.m3u8', async (req, res) => {
     const targetUrl = req.query.url;
     if (!targetUrl) return res.status(400).send('Missing url');
 
     try {
-        const proto = req.headers['x-forwarded-proto'] || req.protocol || 'https';
-        const hostUrl = PUBLIC_BASE_URL || `${proto}://${req.headers.host}`;
+        const clientIp = (req.headers['x-forwarded-for'] || '').split(',')[0].trim() || req.socket.remoteAddress;
+        const cleanedM3u8 = await buildCleanM3U8(targetUrl, clientIp);
 
-        const response = await axios.get(targetUrl, {
-            headers: CLIENT_HEADERS,
-            httpsAgent,
-            responseType: 'text',
-            timeout: 7000
-        });
-
-        const content = response.data;
-        if (typeof content === 'string' && content.includes('#EXTM3U')) {
-            const cleanedM3u8 = stripAdsFromM3U8(content, targetUrl, hostUrl);
-            res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
-            res.setHeader('Cache-Control', 'public, max-age=600');
+        if (cleanedM3u8) {
+            res.setHeader('Content-Type', 'application/vnd.apple.mpegurl; charset=utf-8');
+            res.setHeader('Cache-Control', 'public, max-age=3600');
             return res.send(cleanedM3u8);
         }
 
@@ -670,4 +816,4 @@ app.get('/health', (req, res) => res.status(200).send('OK'));
 const addonRouter = getRouter(builder.getInterface());
 app.use('/', addonRouter);
 
-app.listen(PORT, () => console.log(`Addon NguonC v9.5.0 (AdBlock) running on port ${PORT}`));
+app.listen(PORT, () => console.log(`Addon NguonC v9.7.0 (iOS & TV AdBlock) running on port ${PORT}`));
