@@ -10,7 +10,6 @@ const PORT = process.env.PORT || 7000;
 
 let PUBLIC_BASE_URL = (process.env.RENDER_EXTERNAL_URL || 'https://stremio-nguonc-hzjc.onrender.com').replace(/\/$/, '');
 
-// TẮT keepAlive ĐỂ TRÁNH TREO SOCKET VÀ DEADLOCK TRÊN RENDER
 const httpsAgent = new https.Agent({
     keepAlive: false,
     rejectUnauthorized: false
@@ -22,7 +21,6 @@ const CLIENT_HEADERS = {
     'Accept-Language': 'vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7'
 };
 
-// Bộ nhớ đệm RAM tự động giải phóng
 const cache = new Map();
 function getCache(key) {
     const item = cache.get(key);
@@ -38,7 +36,6 @@ function setCache(key, value, ttlSeconds = 1800) {
     cache.set(key, { value, expiry: Date.now() + ttlSeconds * 1000 });
 }
 
-// Lưu trạng thái M3U8 hoặc lỗi gần nhất để kiểm tra qua /inspect-last
 let lastPlayedM3U8Info = null;
 
 function encodeUrlBase64(url) {
@@ -61,9 +58,9 @@ function decodeUrlBase64(b64) {
 
 const builder = new addonBuilder({
     id: 'org.nguonc.stremio.v86',
-    version: '9.8.2',
-    name: 'NguonC Siêu Nhẹ (Deep AdBlock v9.8.2)',
-    description: 'Chống treo Render + Giả lập Header vượt tường lửa + Cắt quảng cáo phút 15',
+    version: '9.8.3',
+    name: 'NguonC Siêu Nhẹ (Deep AdBlock v9.8.3)',
+    description: 'Vượt lỗi 404 CDN phim1280 + Chống treo Render + Cắt quảng cáo phút 15',
     resources: ['catalog', 'meta', 'stream'],
     types: ['movie', 'series', 'anime'],
     idPrefixes: ['tt', 'nguonc_'],
@@ -161,7 +158,6 @@ function analyzeSegmentUrl(absUrl) {
     }
 }
 
-// THUẬT TOÁN QUÉT TỪNG PHÂN ĐOẠN (SEGMENT-LEVEL SCANNER)
 function stripAdsSegmentLevel(m3u8Content, baseUrl) {
     const lines = m3u8Content.split(/\r?\n/);
     const headerLines = [];
@@ -275,7 +271,7 @@ function stripAdsSegmentLevel(m3u8Content, baseUrl) {
         if (c > maxDurCount) { maxDurCount = c; standardDur = parseFloat(d); }
     }
 
-    // 2. Đánh dấu từng phân đoạn nghi vấn theo URL / Thư mục / Kiểu tên file
+    // 2. Đánh dấu phân đoạn theo từ khóa / thư mục / kiểu tên file
     for (const seg of segments) {
         const lowerUrl = seg.absUrl.toLowerCase();
         if (lowerUrl.includes('9922') || lowerUrl.includes('/adjump/') || lowerUrl.includes('/ads/') || lowerUrl.includes('quangcao') || lowerUrl.includes('promo')) {
@@ -295,7 +291,7 @@ function stripAdsSegmentLevel(m3u8Content, baseUrl) {
         }
     }
 
-    // 3. Quét theo khối ngăn cách bởi DISCONTINUITY (nếu có)
+    // 3. Quét khối ngắn nằm giữa DISCONTINUITY
     if (segments.some(s => s.discontinuityBefore)) {
         let blockStart = 0;
         for (let i = 1; i <= segments.length; i++) {
@@ -313,7 +309,7 @@ function stripAdsSegmentLevel(m3u8Content, baseUrl) {
         }
     }
 
-    // 4. Quét đứt gãy chuỗi số thứ tự tên file (Sequential Jump Detector)
+    // 4. Quét đứt gãy chuỗi số thứ tự tên file
     for (let i = 0; i < segments.length; i++) {
         if (segments[i].isAd || segments[i].seqNum === null) continue;
         if (i > 0 && segments[i - 1].seqNum !== null) {
@@ -413,48 +409,63 @@ function stripAdsSegmentLevel(m3u8Content, baseUrl) {
     };
 }
 
-async function buildCleanM3U8(masterOrMediaUrl, clientIp) {
-    const cacheKey = `clean_v982:${masterOrMediaUrl}`;
+// Hàm tải M3U8 thông minh: Tự động thử nhiều bộ Header để vượt lỗi 404/403 của CDN phim1280.tv
+async function fetchM3U8WithFallback(targetUrl) {
+    const headerProfiles = [
+        // Profile 1: Sạch hoàn toàn như Stremio/VLC gọi trực tiếp (Không Referer, Không Origin, Không X-Forwarded-For)
+        {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Stremio/4.4.168 Chrome/126.0.0.0 Safari/537.36',
+            'Accept': '*/*'
+        },
+        // Profile 2: Giả lập trình phát gốc của KKPhim
+        {
+            ...CLIENT_HEADERS,
+            'Referer': 'https://player.phimapi.com/',
+            'Origin': 'https://player.phimapi.com'
+        },
+        // Profile 3: Giả lập trình phát OPhim
+        {
+            ...CLIENT_HEADERS,
+            'Referer': 'https://ophim1.com/',
+            'Origin': 'https://ophim1.com'
+        }
+    ];
+
+    let lastError = null;
+    for (let i = 0; i < headerProfiles.length; i++) {
+        try {
+            const res = await axios.get(targetUrl, {
+                headers: headerProfiles[i],
+                httpsAgent,
+                responseType: 'text',
+                timeout: 8000
+            });
+            if (res.data && typeof res.data === 'string' && res.data.includes('#EXTM3U')) {
+                return { content: res.data, profileUsed: i + 1 };
+            }
+        } catch (err) {
+            lastError = err;
+        }
+    }
+    throw lastError || new Error('Failed all header profiles');
+}
+
+async function buildCleanM3U8(masterOrMediaUrl) {
+    const cacheKey = `clean_v983:${masterOrMediaUrl}`;
     const cached = getCache(cacheKey);
     if (cached) return cached;
 
-    let originUrl = 'https://phimapi.com';
-    try { originUrl = new URL(masterOrMediaUrl).origin; } catch (e) {}
-
-    const reqHeaders = {
-        ...CLIENT_HEADERS,
-        'Referer': `${originUrl}/`,
-        'Origin': originUrl
-    };
-    if (clientIp) {
-        reqHeaders['X-Forwarded-For'] = clientIp;
-        reqHeaders['X-Real-IP'] = clientIp;
-    }
-
     try {
-        const res1 = await axios.get(masterOrMediaUrl, {
-            headers: reqHeaders,
-            httpsAgent,
-            responseType: 'text',
-            timeout: 10000
-        });
-
-        let content = res1.data;
+        const res1 = await fetchM3U8WithFallback(masterOrMediaUrl);
+        let content = res1.content;
         let finalBaseUrl = masterOrMediaUrl;
 
         if (typeof content === 'string' && content.includes('#EXT-X-STREAM-INF')) {
             const variantUrl = pickBestVariantUrl(content, masterOrMediaUrl);
             if (variantUrl) {
-                let varOrigin = originUrl;
-                try { varOrigin = new URL(variantUrl).origin; } catch (e) {}
-                const res2 = await axios.get(variantUrl, {
-                    headers: { ...reqHeaders, 'Referer': `${varOrigin}/`, 'Origin': varOrigin },
-                    httpsAgent,
-                    responseType: 'text',
-                    timeout: 10000
-                });
-                if (typeof res2.data === 'string' && res2.data.includes('#EXTM3U')) {
-                    content = res2.data;
+                const res2 = await fetchM3U8WithFallback(variantUrl);
+                if (res2.content && res2.content.includes('#EXTM3U')) {
+                    content = res2.content;
                     finalBaseUrl = variantUrl;
                 }
             }
@@ -464,6 +475,7 @@ async function buildCleanM3U8(masterOrMediaUrl, clientIp) {
             const result = stripAdsSegmentLevel(content, finalBaseUrl);
             lastPlayedM3U8Info = {
                 status: 'SUCCESS_CLEANED',
+                profileUsed: res1.profileUsed,
                 masterUrl: masterOrMediaUrl,
                 mediaUrl: finalBaseUrl,
                 timestamp: new Date().toISOString(),
@@ -667,7 +679,7 @@ async function getExternalStreams(providerName, baseUrl, slug, searchKeywords, t
 
             results.push({
                 name: `🛡️ [${providerName}] Không QC`,
-                title: `Tập ${cleanEpName}${srvName} (Lọc sâu v9.8.2)`,
+                title: `Tập ${cleanEpName}${srvName} (Lọc sâu v9.8.3)`,
                 url: `${baseProxyUrl}/hls/${encoded}/master.m3u8`
             });
 
@@ -784,7 +796,7 @@ builder.defineMetaHandler(async ({ type, id }) => {
 // 3. STREAM HANDLER
 builder.defineStreamHandler(async ({ type, id }) => {
     try {
-        const streamCacheKey = `stream_v982:${type}:${id}`;
+        const streamCacheKey = `stream_v983:${type}:${id}`;
         const cachedStreams = getCache(streamCacheKey);
         if (cachedStreams) return { streams: cachedStreams };
 
@@ -910,8 +922,7 @@ app.get('/hls/:encoded/master.m3u8', async (req, res) => {
     if (!targetUrl) return res.status(400).send('Invalid stream URL');
 
     try {
-        const clientIp = (req.headers['x-forwarded-for'] || '').split(',')[0].trim() || req.socket.remoteAddress;
-        const cleanedM3u8 = await buildCleanM3U8(targetUrl, clientIp);
+        const cleanedM3u8 = await buildCleanM3U8(targetUrl);
 
         if (cleanedM3u8) {
             res.setHeader('Content-Type', 'application/vnd.apple.mpegurl; charset=utf-8');
@@ -930,8 +941,7 @@ app.get('/clean.m3u8', async (req, res) => {
     if (!targetUrl) return res.status(400).send('Missing url');
 
     try {
-        const clientIp = (req.headers['x-forwarded-for'] || '').split(',')[0].trim() || req.socket.remoteAddress;
-        const cleanedM3u8 = await buildCleanM3U8(targetUrl, clientIp);
+        const cleanedM3u8 = await buildCleanM3U8(targetUrl);
 
         if (cleanedM3u8) {
             res.setHeader('Content-Type', 'application/vnd.apple.mpegurl; charset=utf-8');
@@ -945,7 +955,6 @@ app.get('/clean.m3u8', async (req, res) => {
     }
 });
 
-// Cổng soi chi tiết phút 15 và bắt lỗi tường lửa
 app.get('/inspect-last', (req, res) => {
     if (!lastPlayedM3U8Info) {
         return res.json({ message: 'Chưa có tập phim nào được mở qua luồng Không QC kể từ lúc server khởi động.' });
@@ -953,14 +962,14 @@ app.get('/inspect-last', (req, res) => {
     res.json(lastPlayedM3U8Info);
 });
 
-app.get('/status', (req, res) => res.json({ ok: true, version: '9.8.2', uptime: process.uptime() }));
+app.get('/status', (req, res) => res.json({ ok: true, version: '9.8.3', uptime: process.uptime() }));
 app.get('/health', (req, res) => res.status(200).send('OK'));
 
 const addonRouter = getRouter(builder.getInterface());
 app.use('/', addonRouter);
 
 app.listen(PORT, () => {
-    console.log(`Addon NguonC v9.8.2 (Deep AdBlock) running on port ${PORT}`);
+    console.log(`Addon NguonC v9.8.3 (Deep AdBlock) running on port ${PORT}`);
 
     setInterval(() => {
         const selfUrl = process.env.RENDER_EXTERNAL_URL || PUBLIC_BASE_URL;
