@@ -8,7 +8,8 @@ const KKPHIM_API = 'https://phimapi.com';
 const OPHIM_API = 'https://ophim1.com';
 const PORT = process.env.PORT || 7000;
 
-// Giữ kết nối TCP giúp tăng tốc độ gọi API và giảm lỗi timeout trên Render
+let PUBLIC_BASE_URL = (process.env.RENDER_EXTERNAL_URL || '').replace(/\/$/, '');
+
 const httpsAgent = new https.Agent({ keepAlive: true, rejectUnauthorized: false });
 
 const CLIENT_HEADERS = {
@@ -35,9 +36,9 @@ function setCache(key, value, ttlSeconds = 1800) {
 
 const builder = new addonBuilder({
     id: 'org.nguonc.stremio.v86',
-    version: '9.4.0',
-    name: 'NguonC Siêu Nhẹ (Auto-Fallback)',
-    description: 'Chống sập: Tự động chuyển đổi dự phòng NguonC + KKPhim + OPhim khi nghẽn mạng',
+    version: '9.5.0',
+    name: 'NguonC Siêu Nhẹ (AdBlock Direct)',
+    description: 'Tự động lọc bỏ quảng cáo ngầm trong luồng Direct (KKPhim/OPhim) + Chống sập',
     resources: ['catalog', 'meta', 'stream'],
     types: ['movie', 'series', 'anime'],
     idPrefixes: ['tt', 'nguonc_'],
@@ -85,7 +86,142 @@ function findEpisodeItem(epItems, episodeTarget, type) {
     return null;
 }
 
-// Gọi API NguonC an toàn (Bỏ Origin giả để tránh bị Cloudflare chặn trên Render)
+// THUẬT TOÁN LỌC BỎ QUẢNG CÁO CHÈN NGẦM TRONG FILE M3U8 (#EXT-X-DISCONTINUITY)
+function stripAdsFromM3U8(m3u8Content, baseUrl, proxyBaseUrl) {
+    const lines = m3u8Content.split(/\r?\n/);
+
+    // 1. Nếu là Master Playlist (chứa các luồng độ phân giải con) -> viết lại link trỏ về bộ lọc
+    if (m3u8Content.includes('#EXT-X-STREAM-INF')) {
+        return lines.map(line => {
+            const trimmed = line.trim();
+            if (!trimmed || trimmed.startsWith('#')) return line;
+            try {
+                const absUrl = new URL(trimmed, baseUrl).href;
+                return `${proxyBaseUrl}/clean.m3u8?url=${encodeURIComponent(absUrl)}`;
+            } catch (e) {
+                return line;
+            }
+        }).join('\n');
+    }
+
+    // 2. Nếu là Media Playlist (chứa các phân đoạn .ts / .png / .jpg)
+    const headerLines = [];
+    const blocks = [];
+    let currentBlock = [];
+    let seenFirstSegment = false;
+
+    for (let i = 0; i < lines.length; i++) {
+        const line = lines[i].trim();
+        if (!line) continue;
+
+        if (line === '#EXT-X-ENDLIST') continue;
+
+        if (line === '#EXT-X-DISCONTINUITY') {
+            seenFirstSegment = true;
+            if (currentBlock.length > 0) {
+                blocks.push(currentBlock);
+                currentBlock = [];
+            }
+            continue;
+        }
+
+        if (!seenFirstSegment && line.startsWith('#') && !line.startsWith('#EXTINF') && !line.startsWith('#EXT-X-KEY') && !line.startsWith('#EXT-X-BYTERANGE')) {
+            headerLines.push(line);
+            continue;
+        }
+
+        seenFirstSegment = true;
+        currentBlock.push(line);
+    }
+    if (currentBlock.length > 0) blocks.push(currentBlock);
+
+    // Phân tích từng khối phân đoạn (ngăn cách bởi DISCONTINUITY)
+    const analyzedBlocks = blocks.map(block => {
+        let duration = 0;
+        let segCount = 0;
+        const urls = [];
+        for (const l of block) {
+            if (l.startsWith('#EXTINF:')) {
+                const dur = parseFloat(l.substring(8).split(',')[0]);
+                if (!isNaN(dur)) duration += dur;
+            } else if (!l.startsWith('#')) {
+                segCount++;
+                try {
+                    urls.push(new URL(l, baseUrl).href);
+                } catch (e) {
+                    urls.push(l);
+                }
+            }
+        }
+        // Lấy thư mục gốc của các phân đoạn trong khối để nhận diện nguồn
+        let prefix = '';
+        if (urls.length > 0) {
+            try {
+                const u = new URL(urls[0]);
+                const pathParts = u.pathname.split('/');
+                pathParts.pop();
+                prefix = u.origin + pathParts.join('/');
+            } catch (e) {}
+        }
+        return { rawLines: block, duration, segCount, prefix };
+    }).filter(b => b.segCount > 0);
+
+    // Tìm prefix (thư mục máy chủ) của bộ phim chính (chiếm tổng thời lượng lớn nhất)
+    const prefixTotals = {};
+    for (const b of analyzedBlocks) {
+        prefixTotals[b.prefix] = (prefixTotals[b.prefix] || 0) + b.duration;
+    }
+    let mainPrefix = '';
+    let maxDur = -1;
+    for (const [pref, dur] of Object.entries(prefixTotals)) {
+        if (dur > maxDur) {
+            maxDur = dur;
+            mainPrefix = pref;
+        }
+    }
+
+    // Lọc bỏ các khối quảng cáo:
+    // - Khối khác thư mục gốc với phim chính VÀ ngắn dưới 90 giây
+    // - Hoặc khối chèn giữa rất ngắn (dưới 45 giây, ít hơn 12 phân đoạn) khi có nhiều khối trong phim
+    const cleanBlocks = analyzedBlocks.filter(b => {
+        if (analyzedBlocks.length <= 1) return true;
+        const isDifferentServer = mainPrefix && b.prefix && b.prefix !== mainPrefix;
+        if (isDifferentServer && b.duration < 120) return false;
+        if (b.duration <= 45 && b.segCount <= 12 && maxDur > 180) return false;
+        return true;
+    });
+
+    const finalBlocks = cleanBlocks.length > 0 ? cleanBlocks : analyzedBlocks;
+
+    // Ráp lại file M3U8 sạch với URL tuyệt đối
+    const output = [...headerLines];
+    finalBlocks.forEach((b, idx) => {
+        if (idx > 0) output.push('#EXT-X-DISCONTINUITY');
+        for (const l of b.rawLines) {
+            if (l.startsWith('#')) {
+                // Nếu có thẻ #EXT-X-KEY chứa URI tương đối -> chuyển thành tuyệt đối
+                if (l.startsWith('#EXT-X-KEY') && l.includes('URI="')) {
+                    const replaced = l.replace(/URI="([^"]+)"/, (m, uri) => {
+                        try { return `URI="${new URL(uri, baseUrl).href}"`; } catch (e) { return m; }
+                    });
+                    output.push(replaced);
+                } else {
+                    output.push(l);
+                }
+            } else {
+                try {
+                    output.push(new URL(l, baseUrl).href);
+                } catch (e) {
+                    output.push(l);
+                }
+            }
+        }
+    });
+
+    output.push('#EXT-X-ENDLIST');
+    return output.join('\n');
+}
+
 async function fetchNguonC(endpoint) {
     const cacheKey = `nguonc:${endpoint}`;
     const cached = getCache(cacheKey);
@@ -102,12 +238,10 @@ async function fetchNguonC(endpoint) {
         }
         return null;
     } catch (err) {
-        console.error(`[NguonC Error] ${endpoint}:`, err.message);
         return null;
     }
 }
 
-// Dự phòng: Lấy danh mục phim từ KKPhim nếu NguonC bị chặn hoặc quá tải trên Render
 async function fetchKKPhimCatalog(id, page, search) {
     try {
         let url = `${KKPHIM_API}/danh-sach/phim-moi-cap-nhat?page=${page}`;
@@ -140,7 +274,6 @@ async function fetchKKPhimCatalog(id, page, search) {
             };
         });
     } catch (e) {
-        console.error('[KKPhim Catalog Fallback Error]:', e.message);
         return [];
     }
 }
@@ -257,17 +390,29 @@ async function getExternalStreams(providerName, baseUrl, slug, searchKeywords, t
         if (targetEp && targetEp.link_m3u8 && targetEp.link_m3u8.includes('.m3u8')) {
             const srvName = server.server_name ? ` - ${server.server_name}` : '';
             const cleanEpName = String(targetEp.name || episodeTarget).replace(/^(tập|tap)\s*/i, '');
+            const rawM3u8 = targetEp.link_m3u8;
+
+            // Luồng 1: Đã lọc sạch quảng cáo chèn ngầm (Khuyên dùng)
+            if (PUBLIC_BASE_URL) {
+                results.push({
+                    name: `🛡️ [${providerName}] Không QC`,
+                    title: `Tập ${cleanEpName}${srvName} (Đã cắt Quảng Cáo)`,
+                    url: `${PUBLIC_BASE_URL}/clean.m3u8?url=${encodeURIComponent(rawM3u8)}`
+                });
+            }
+
+            // Luồng 2: Luồng gốc dự phòng
             results.push({
-                name: `⚡ [NguonC-${providerName}] Direct`,
-                title: `Tập ${cleanEpName}${srvName} (Phát ngay trong Stremio)`,
-                url: targetEp.link_m3u8
+                name: `⚡ [${providerName}] Direct`,
+                title: `Tập ${cleanEpName}${srvName} (Luồng gốc)`,
+                url: rawM3u8
             });
         }
     }
     return results;
 }
 
-// 1. CATALOG HANDLER (Có tự động Fallback sang KKPhim nếu NguonC lỗi)
+// 1. CATALOG HANDLER
 builder.defineCatalogHandler(async ({ type, id, extra }) => {
     try {
         const skip = (extra && extra.skip) ? parseInt(extra.skip, 10) : 0;
@@ -285,7 +430,6 @@ builder.defineCatalogHandler(async ({ type, id, extra }) => {
         const data = await fetchNguonC(endpoint);
         let items = data?.items || data?.data?.items || data?.data || [];
 
-        // Nếu NguonC chặn IP Render hoặc trả về rỗng -> Tự động lấy danh sách từ KKPhim
         if (!Array.isArray(items) || items.length === 0) {
             items = await fetchKKPhimCatalog(id, page, extra?.search);
         }
@@ -304,7 +448,7 @@ builder.defineCatalogHandler(async ({ type, id, extra }) => {
     }
 });
 
-// 2. META HANDLER (Hỗ trợ cả NguonC lẫn KKPhim/OPhim khi NguonC lỗi)
+// 2. META HANDLER
 builder.defineMetaHandler(async ({ type, id }) => {
     try {
         if (!id.startsWith('nguonc_')) return { meta: null };
@@ -314,7 +458,6 @@ builder.defineMetaHandler(async ({ type, id }) => {
         let movie = detailData?.movie || detailData?.film;
         let servers = movie?.episodes || detailData?.episodes || [];
 
-        // Dự phòng: Nếu NguonC không tải được chi tiết phim, lấy từ KKPhim hoặc OPhim
         if (!movie) {
             const extData = await fetchExternalMovieDetail(KKPHIM_API, slug, [], null, 1)
                          || await fetchExternalMovieDetail(OPHIM_API, slug, [], null, 1);
@@ -372,7 +515,7 @@ builder.defineMetaHandler(async ({ type, id }) => {
 // 3. STREAM HANDLER
 builder.defineStreamHandler(async ({ type, id }) => {
     try {
-        const streamCacheKey = `stream_v94:${type}:${id}`;
+        const streamCacheKey = `stream_v95:${type}:${id}`;
         const cachedStreams = getCache(streamCacheKey);
         if (cachedStreams) return { streams: cachedStreams };
 
@@ -431,9 +574,7 @@ builder.defineStreamHandler(async ({ type, id }) => {
             getExternalStreams('OP', OPHIM_API, slug, searchKeywords, targetYear, seasonTarget, episodeTarget, type)
         ]);
 
-        const directStreams = [];
         const webStreams = [];
-
         const servers = movie?.episodes || detailData?.episodes || [];
         for (const server of servers) {
             const epItems = server.items || server.server_data || [];
@@ -442,16 +583,7 @@ builder.defineStreamHandler(async ({ type, id }) => {
 
             const srvName = server.server_name ? ` - ${server.server_name}` : '';
             const cleanEpName = String(targetEp.name || episodeTarget).replace(/^(tập|tap)\s*/i, '');
-            const directM3u8 = targetEp.m3u8 || targetEp.link_m3u8;
             const embedUrl = targetEp.embed || targetEp.link_embed || '';
-
-            if (directM3u8 && directM3u8.includes('.m3u8')) {
-                directStreams.push({
-                    name: `⚡ [NguonC] Direct`,
-                    title: `Tập ${cleanEpName}${srvName} (Phát ngay)`,
-                    url: directM3u8
-                });
-            }
 
             if (embedUrl) {
                 webStreams.push({
@@ -462,10 +594,13 @@ builder.defineStreamHandler(async ({ type, id }) => {
             }
         }
 
+        // Ưu tiên đẩy các luồng 🛡️ Không Quảng Cáo lên đầu tiên
+        const cleanStreams = [...kkStreams, ...ophimStreams].filter(s => s.name.includes('Không QC'));
+        const rawDirectStreams = [...kkStreams, ...ophimStreams].filter(s => !s.name.includes('Không QC'));
+
         const allStreams = [
-            ...directStreams,
-            ...kkStreams,
-            ...ophimStreams,
+            ...cleanStreams,
+            ...rawDirectStreams,
             ...webStreams
         ];
 
@@ -491,35 +626,48 @@ builder.defineStreamHandler(async ({ type, id }) => {
 
 const app = express();
 app.use((req, res, next) => {
+    if (!PUBLIC_BASE_URL && req.headers.host) {
+        const proto = req.headers['x-forwarded-proto'] || req.protocol || 'https';
+        PUBLIC_BASE_URL = `${proto}://${req.headers.host}`;
+    }
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Access-Control-Allow-Headers', '*');
     next();
 });
 
-app.get('/health', (req, res) => res.status(200).send('OK'));
+// TRẠM LỌC SẠCH QUẢNG CÁO TRONG PLAYLIST M3U8 (/clean.m3u8)
+app.get('/clean.m3u8', async (req, res) => {
+    const targetUrl = req.query.url;
+    if (!targetUrl) return res.status(400).send('Missing url');
 
-// TRANG KIỂM TRA LỖI KẾT NỐI TỪ RENDER TỚI CÁC NGUỒN PHIM
-app.get('/status', async (req, res) => {
-    const checkSource = async (name, url) => {
-        const start = Date.now();
-        try {
-            const r = await axios.get(url, { headers: CLIENT_HEADERS, httpsAgent, timeout: 5000 });
-            return { name, status: r.status, timeMs: Date.now() - start, ok: true };
-        } catch (err) {
-            return { name, status: err.response?.status || 'ERR', error: err.message, timeMs: Date.now() - start, ok: false };
+    try {
+        const proto = req.headers['x-forwarded-proto'] || req.protocol || 'https';
+        const hostUrl = PUBLIC_BASE_URL || `${proto}://${req.headers.host}`;
+
+        const response = await axios.get(targetUrl, {
+            headers: CLIENT_HEADERS,
+            httpsAgent,
+            responseType: 'text',
+            timeout: 7000
+        });
+
+        const content = response.data;
+        if (typeof content === 'string' && content.includes('#EXTM3U')) {
+            const cleanedM3u8 = stripAdsFromM3U8(content, targetUrl, hostUrl);
+            res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
+            res.setHeader('Cache-Control', 'public, max-age=600');
+            return res.send(cleanedM3u8);
         }
-    };
 
-    const [nguonc, kkphim, ophim] = await Promise.all([
-        checkSource('NguonC', `${NGUONC_API}/films/phim-moi-cap-nhat?page=1`),
-        checkSource('KKPhim', `${KKPHIM_API}/danh-sach/phim-moi-cap-nhat?page=1`),
-        checkSource('OPhim', `${OPHIM_API}/v1/api/danh-sach/phim-moi-cap-nhat?page=1`)
-    ]);
-
-    res.json({ version: '9.4.0', sources: { nguonc, kkphim, ophim } });
+        res.redirect(targetUrl);
+    } catch (e) {
+        res.redirect(targetUrl);
+    }
 });
+
+app.get('/health', (req, res) => res.status(200).send('OK'));
 
 const addonRouter = getRouter(builder.getInterface());
 app.use('/', addonRouter);
 
-app.listen(PORT, () => console.log(`Addon NguonC v9.4.0 running on port ${PORT}`));
+app.listen(PORT, () => console.log(`Addon NguonC v9.5.0 (AdBlock) running on port ${PORT}`));
