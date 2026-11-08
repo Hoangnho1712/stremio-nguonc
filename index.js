@@ -697,3 +697,215 @@ builder.defineMetaHandler(async ({ type, id }) => {
                     id: `nguonc_${slug}:${epNum}`,
                     title: ep.name ? (String(ep.name).toLowerCase().startsWith('tập') ? ep.name : `Tập ${ep.name}`) : `Tập ${epNum}`,
                     season: 1,
+                    episode: epNum
+                });
+            });
+        }
+
+        return {
+            meta: {
+                id: `nguonc_${slug}`,
+                type,
+                name: movie.name,
+                poster: movie.poster_url || movie.thumb_url,
+                background: movie.thumb_url || movie.poster_url,
+                description: movie.description ? movie.description.replace(/<[^>]*>?/gm, '') : '',
+                releaseInfo: movie.quality ? `${movie.quality} | ${movie.language || ''}` : undefined,
+                videos: episodesList.length > 0 ? episodesList : undefined
+            }
+        };
+    } catch (e) {
+        return { meta: null };
+    }
+});
+
+// 3. STREAM HANDLER
+builder.defineStreamHandler(async ({ type, id }) => {
+    try {
+        const streamCacheKey = `stream_v98:${type}:${id}`;
+        const cachedStreams = getCache(streamCacheKey);
+        if (cachedStreams) return { streams: cachedStreams };
+
+        let slug = null;
+        let seasonTarget = 1;
+        let episodeTarget = 1;
+        let imdbName = null;
+        let targetYear = null;
+
+        if (id.startsWith('nguonc_')) {
+            const parts = id.replace('nguonc_', '').split(':');
+            slug = parts[0];
+            if (parts.length > 1) episodeTarget = parseInt(parts[1], 10) || 1;
+        } else if (id.startsWith('tt')) {
+            const parts = id.split(':');
+            const imdbId = parts[0];
+            if (parts.length > 2) {
+                seasonTarget = parseInt(parts[1], 10) || 1;
+                episodeTarget = parseInt(parts[2], 10) || 1;
+            }
+
+            const imdbMeta = await getImdbMeta(type, imdbId);
+            if (!imdbMeta) return { streams: [] };
+            imdbName = imdbMeta.name;
+            targetYear = imdbMeta.year;
+        }
+
+        let nguonCPromise;
+        if (slug) {
+            nguonCPromise = fetchNguonC(`/film/${slug}`);
+        } else if (imdbName) {
+            nguonCPromise = (async () => {
+                const searchData = await fetchNguonC(`/films/search?keyword=${encodeURIComponent(imdbName)}`);
+                const items = searchData?.items || searchData?.data?.items || searchData?.data || [];
+                const best = pickBestSearchMatch(items, [imdbName], targetYear, seasonTarget);
+                if (best?.slug) {
+                    slug = best.slug;
+                    return await fetchNguonC(`/film/${best.slug}`);
+                }
+                return null;
+            })();
+        } else {
+            nguonCPromise = Promise.resolve(null);
+        }
+
+        const detailData = await nguonCPromise;
+        const movie = detailData?.movie || detailData?.film;
+
+        const searchKeywords = [];
+        if (imdbName) searchKeywords.push(imdbName);
+        if (movie?.name && !searchKeywords.includes(movie.name)) searchKeywords.push(movie.name);
+        if (movie?.original_name && !searchKeywords.includes(movie.original_name)) searchKeywords.push(movie.original_name);
+
+        const [kkStreams, ophimStreams] = await Promise.all([
+            getExternalStreams('KK', KKPHIM_API, slug, searchKeywords, targetYear, seasonTarget, episodeTarget, type),
+            getExternalStreams('OP', OPHIM_API, slug, searchKeywords, targetYear, seasonTarget, episodeTarget, type)
+        ]);
+
+        const webStreams = [];
+        const servers = movie?.episodes || detailData?.episodes || [];
+        for (const server of servers) {
+            const epItems = server.items || server.server_data || [];
+            const targetEp = findEpisodeItem(epItems, episodeTarget, type);
+            if (!targetEp) continue;
+
+            const srvName = server.server_name ? ` - ${server.server_name}` : '';
+            const cleanEpName = String(targetEp.name || episodeTarget).replace(/^(tập|tap)\s*/i, '');
+            const embedUrl = targetEp.embed || targetEp.link_embed || '';
+
+            if (embedUrl) {
+                webStreams.push({
+                    name: `🌐 [NguonC] Web`,
+                    title: `Tập ${cleanEpName}${srvName} (Mở trình duyệt)`,
+                    externalUrl: embedUrl
+                });
+            }
+        }
+
+        const opClean = ophimStreams.filter(s => s.name.includes('Không QC'));
+        const kkClean = kkStreams.filter(s => s.name.includes('Không QC'));
+        const rawDirectStreams = [...ophimStreams, ...kkStreams].filter(s => !s.name.includes('Không QC'));
+
+        const allStreams = [
+            ...opClean,
+            ...kkClean,
+            ...rawDirectStreams,
+            ...webStreams
+        ];
+
+        const uniqueStreams = [];
+        const seenUrls = new Set();
+        for (const s of allStreams) {
+            const key = s.url || s.externalUrl;
+            if (key && !seenUrls.has(key)) {
+                seenUrls.add(key);
+                uniqueStreams.push(s);
+            }
+        }
+
+        if (uniqueStreams.length > 0) {
+            setCache(streamCacheKey, uniqueStreams, 1800);
+        }
+
+        return { streams: uniqueStreams };
+    } catch (e) {
+        return { streams: [] };
+    }
+});
+
+const app = express();
+app.use((req, res, next) => {
+    if (!PUBLIC_BASE_URL && req.headers.host) {
+        const proto = req.headers['x-forwarded-proto'] || req.protocol || 'https';
+        PUBLIC_BASE_URL = `${proto}://${req.headers.host}`;
+    }
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Headers', '*');
+    next();
+});
+
+app.get('/hls/:encoded/master.m3u8', async (req, res) => {
+    const targetUrl = decodeUrlBase64(req.params.encoded);
+    if (!targetUrl) return res.status(400).send('Invalid stream URL');
+
+    try {
+        const clientIp = (req.headers['x-forwarded-for'] || '').split(',')[0].trim() || req.socket.remoteAddress;
+        const cleanedM3u8 = await buildCleanM3U8(targetUrl, clientIp);
+
+        if (cleanedM3u8) {
+            res.setHeader('Content-Type', 'application/vnd.apple.mpegurl; charset=utf-8');
+            res.setHeader('Cache-Control', 'public, max-age=3600');
+            return res.send(cleanedM3u8);
+        }
+
+        res.redirect(targetUrl);
+    } catch (e) {
+        res.redirect(targetUrl);
+    }
+});
+
+app.get('/clean.m3u8', async (req, res) => {
+    const targetUrl = req.query.url;
+    if (!targetUrl) return res.status(400).send('Missing url');
+
+    try {
+        const clientIp = (req.headers['x-forwarded-for'] || '').split(',')[0].trim() || req.socket.remoteAddress;
+        const cleanedM3u8 = await buildCleanM3U8(targetUrl, clientIp);
+
+        if (cleanedM3u8) {
+            res.setHeader('Content-Type', 'application/vnd.apple.mpegurl; charset=utf-8');
+            res.setHeader('Cache-Control', 'public, max-age=3600');
+            return res.send(cleanedM3u8);
+        }
+
+        res.redirect(targetUrl);
+    } catch (e) {
+        res.redirect(targetUrl);
+    }
+});
+
+// Cổng soi chi tiết phút 15
+app.get('/inspect-last', (req, res) => {
+    if (!lastPlayedM3U8Info) {
+        return res.json({ message: 'Chưa có tập phim nào được mở qua luồng Không QC kể từ lúc server khởi động.' });
+    }
+    res.json(lastPlayedM3U8Info);
+});
+
+// Cổng kiểm tra trạng thái máy chủ
+app.get('/status', (req, res) => res.json({ ok: true, version: '9.8.1', uptime: process.uptime() }));
+app.get('/health', (req, res) => res.status(200).send('OK'));
+
+const addonRouter = getRouter(builder.getInterface());
+app.use('/', addonRouter);
+
+app.listen(PORT, () => {
+    console.log(`Addon NguonC v9.8.1 (Anti-Freeze & Segment AdBlock) running on port ${PORT}`);
+
+    // Tự động gõ cửa giữ server Render không ngủ đông mỗi 10 phút
+    setInterval(() => {
+        const selfUrl = process.env.RENDER_EXTERNAL_URL || PUBLIC_BASE_URL;
+        if (selfUrl) {
+            axios.get(`${selfUrl}/health`, { timeout: 8000 }).catch(() => {});
+        }
+    }, 10 * 60 * 1000);
+});
