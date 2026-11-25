@@ -473,3 +473,4 @@ app.use('/', addonRouter);
 app.listen(PORT, () => {
     console.log(`Addon NguonC v10.2.0 running on port ${PORT}`);
 });
+module.exports = app;
